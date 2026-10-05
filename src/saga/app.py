@@ -99,13 +99,32 @@ def apply_outcome(workflow: dict[str, Any], state: dict[str, Any], outcome: str,
     return next_state
 
 
+def validate_event_id(event_id: Any) -> str:
+    """An eventId is a non-empty string of at most 100 characters; null/non-string are rejected."""
+    if not isinstance(event_id, str) or not event_id or len(event_id) > 100:
+        raise InvalidRequest("eventId must be a non-empty string of at most 100 characters")
+    return event_id
+
+
 class Engine:
-    """sqlite-backed instance store; one row per instance, state kept as JSON."""
+    """sqlite-backed instance store; one row per instance, state kept as JSON.
+
+    An optional per-instance event ledger (table ``instance_events``) stores the normalized
+    request and the full response of every event carrying an ``eventId``, so retries replay
+    the original response instead of re-entering the state machine.
+    """
 
     def __init__(self, path: str = ":memory:") -> None:
         self._lock = threading.RLock()
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.execute("CREATE TABLE IF NOT EXISTS instances (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, state TEXT NOT NULL)")
+        # Ledger table is created on demand so sqlite files written by older builds keep working.
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS instance_events ("
+            "instance_id TEXT NOT NULL, event_id TEXT NOT NULL, "
+            "outcome TEXT NOT NULL, detail TEXT NOT NULL, response TEXT NOT NULL, "
+            "PRIMARY KEY (instance_id, event_id))"
+        )
         self._db.commit()
         self._workflows: dict[str, dict[str, Any]] = dict(WORKFLOWS)
 
@@ -138,16 +157,41 @@ class Engine:
             self._db.commit()
         return {"id": instance_id, "workflow": name, "state": state}
 
-    def advance(self, instance_id: str, outcome: Any, detail: Any = None) -> dict[str, Any]:
+    def advance(self, instance_id: str, outcome: Any, detail: Any = None, event_id: str | None = None) -> dict[str, Any]:
+        if event_id is not None:
+            validate_event_id(event_id)
         with self._lock:
             row = self._db.execute("SELECT workflow, state FROM instances WHERE id = ?", (instance_id,)).fetchone()
             if row is None:
                 raise InstanceNotFound(f"no instance {instance_id}")
-            workflow = self.workflow(row[0])
+            workflow_name = row[0]
+            if event_id is not None:
+                ledger = self._db.execute(
+                    "SELECT outcome, detail, response FROM instance_events WHERE instance_id = ? AND event_id = ?",
+                    (instance_id, event_id),
+                ).fetchone()
+                if ledger is not None:
+                    stored_outcome, stored_detail, stored_response = ledger
+                    # JSON-value equality: a missing detail and an explicit null are the same value.
+                    normalized_detail = None if detail is None else json.loads(json.dumps(detail))
+                    if outcome == stored_outcome and normalized_detail == json.loads(stored_detail):
+                        return json.loads(stored_response)
+                    raise InvalidTransition(
+                        f"eventId {event_id!r} was already submitted to this instance with a different outcome/detail"
+                    )
+            workflow = self.workflow(workflow_name)
             state = apply_outcome(workflow, json.loads(row[1]), outcome, detail)
+            response = {"id": instance_id, "workflow": workflow_name, "state": state}
+            # Invalid outcome / terminal transitions raise above, so no ledger row is written for them.
+            if event_id is not None:
+                normalized_detail = None if detail is None else json.loads(json.dumps(detail))
+                self._db.execute(
+                    "INSERT INTO instance_events (instance_id, event_id, outcome, detail, response) VALUES (?, ?, ?, ?, ?)",
+                    (instance_id, event_id, outcome, json.dumps(normalized_detail), json.dumps(response)),
+                )
             self._db.execute("UPDATE instances SET state = ? WHERE id = ?", (json.dumps(state), instance_id))
             self._db.commit()
-        return {"id": instance_id, "workflow": row[0], "state": state}
+        return response
 
     def get(self, instance_id: str) -> dict[str, Any]:
         with self._lock:
@@ -230,9 +274,12 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                     return self._send(201, engine.start(parts[2], body.get("context")))
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "events":
                     body = self._read_json()
-                    if not isinstance(body, dict) or set(body) - {"outcome", "detail"}:
-                        raise InvalidRequest("body must be {\"outcome\": \"succeeded|failed\", \"detail\": ...}")
-                    return self._send(200, engine.advance(parts[2], body.get("outcome"), body.get("detail")))
+                    if not isinstance(body, dict) or set(body) - {"outcome", "detail", "eventId"}:
+                        raise InvalidRequest("body must be {\"outcome\": \"succeeded|failed\", \"detail\": ..., \"eventId\": ...}")
+                    # A missing eventId keeps the legacy (non-idempotent) behavior; an explicit
+                    # null is an invalid eventId, so presence must be distinguished from absence.
+                    event_id = validate_event_id(body["eventId"]) if "eventId" in body else None
+                    return self._send(200, engine.advance(parts[2], body.get("outcome"), body.get("detail"), event_id))
                 return self._send(404, {"error": {"code": "not_found"}})
             except SagaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
