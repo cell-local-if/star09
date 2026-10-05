@@ -57,19 +57,36 @@ def validate_workflow(payload: Any) -> dict[str, Any]:
         raise InvalidRequest("steps must be an array of 1..20 items")
     cleaned = []
     for index, step in enumerate(steps):
-        if not isinstance(step, dict) or set(step) - {"name", "compensation"}:
-            raise InvalidRequest(f"steps[{index}] must be an object with name/compensation")
+        if not isinstance(step, dict) or set(step) - {"name", "compensation", "retry"}:
+            raise InvalidRequest(f"steps[{index}] must be an object with name/compensation/retry")
         name, compensation = step.get("name"), step.get("compensation")
         if not isinstance(name, str) or not name or len(name) > 100:
             raise InvalidRequest(f"steps[{index}].name must be a non-empty string of at most 100 characters")
         if compensation is not None and (not isinstance(compensation, str) or not compensation):
             raise InvalidRequest(f"steps[{index}].compensation must be a non-empty string when present")
-        cleaned.append({"name": name, "compensation": compensation})
+        cleaned_step: dict[str, Any] = {"name": name, "compensation": compensation}
+        if "retry" in step:
+            cleaned_step["retry"] = _validate_retry(step["retry"], index)
+        cleaned.append(cleaned_step)
     return {"steps": cleaned}
 
 
+def _validate_retry(retry: Any, index: int) -> dict[str, Any]:
+    """A step's retry policy is exactly {"maxAttempts": <int 2..10>}; anything else is 400."""
+    if not isinstance(retry, dict) or set(retry) - {"maxAttempts"}:
+        raise InvalidRequest(f"steps[{index}].retry must be an object with only maxAttempts")
+    if "maxAttempts" not in retry:
+        raise InvalidRequest(f"steps[{index}].retry.maxAttempts is required")
+    max_attempts = retry["maxAttempts"]
+    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int):
+        raise InvalidRequest(f"steps[{index}].retry.maxAttempts must be an integer")
+    if not 2 <= max_attempts <= 10:
+        raise InvalidRequest(f"steps[{index}].retry.maxAttempts must be between 2 and 10")
+    return {"maxAttempts": max_attempts}
+
+
 def initial_state(workflow: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
-    return {"status": "running", "step": workflow["steps"][0]["name"], "index": 0,
+    return {"status": "running", "step": workflow["steps"][0]["name"], "index": 0, "attempt": 1,
             "completed": [], "compensated": [], "context": dict(context), "failure": None}
 
 
@@ -81,9 +98,19 @@ def apply_outcome(workflow: dict[str, Any], state: dict[str, Any], outcome: str,
         raise InvalidRequest("outcome must be 'succeeded' or 'failed'")
     steps = workflow["steps"]
     index = int(state["index"])
+    # Instances persisted before the attempt field existed are treated as attempt=1.
+    attempt = int(state.get("attempt", 1))
     next_state = json.loads(json.dumps(state))
+    next_state["attempt"] = attempt
     if outcome == "failed":
         next_state["failure"] = {"step": steps[index]["name"], "detail": detail}
+        retry = steps[index].get("retry") or {}
+        max_attempts = retry.get("maxAttempts")
+        if max_attempts is not None and attempt < max_attempts:
+            # Retryable failure: stay on the same step, bump the attempt counter,
+            # keep completed/compensated untouched.
+            next_state["attempt"] = attempt + 1
+            return next_state
         pending = [s["compensation"] for s in steps[: index + 1] if s.get("compensation")]
         next_state["compensated"] = list(reversed(pending))
         next_state["completed"] = state["completed"]
@@ -92,6 +119,8 @@ def apply_outcome(workflow: dict[str, Any], state: dict[str, Any], outcome: str,
         return next_state
     completed = list(state["completed"]) + [steps[index]["name"]]
     next_state["completed"] = completed
+    next_state["failure"] = None
+    next_state["attempt"] = 1
     if index + 1 >= len(steps):
         next_state["status"] = "completed"
         next_state["step"] = None

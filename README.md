@@ -15,7 +15,9 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 ## 概念
 
 - **工作流定义**：`{"steps":[{"name":"reserve-stock","compensation":"release-stock"}, ...]}`（1–20 步）。
+  每步可带可选 `retry` 对象，只允许 `{"maxAttempts": <整数 2..10>}`。
 - **实例状态**：`{"status":"running|completed|compensated", "step": <当前步骤名或 null>, "index": <int>,
+  "attempt": <当前步骤的尝试序号，从 1 开始，进入新步骤时重置为 1>,
   "completed":[<已完成步骤名>], "compensated":[<将/已执行的补偿名，逆序>], "context": {...}, "failure": null|{...}}`。
 - 状态转移是**纯函数**：同样的 `(状态, outcome)` 永远得到同样的下一个状态。
 
@@ -30,6 +32,8 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 ### `PUT /v1/workflows/{name}`
 请求体 = 工作流定义 → `200 {"workflow": name, "steps": [...]}`。
 定义非法（step 非对象、`name` 空/超 100 字符、未知字段、步数越界）⇒ `400 invalid_request`。
+步骤的 `retry` 只允许 `{"maxAttempts": n}`（整数，2–10）；`retry` 缺失 `maxAttempts`、含未知字段、
+值为布尔/非整数、小于 2 或大于 10 ⇒ `400 invalid_request`，已有定义保持不变。
 
 ### `POST /v1/workflows/{name}/instances`
 请求体：`{"context": {...}}`（可省）→ **`201`** `{"id": <uuid>, "workflow": name, "state": {...}}`。
@@ -37,8 +41,12 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 ### `POST /v1/instances/{id}/events`
 请求体：`{"outcome": "succeeded"|"failed", "detail": <任意 JSON>, "eventId": "<可选>"}` →
 `200 {"id":..., "workflow":..., "state": {...}}`。
-- `succeeded`：推进到下一步；已是最后一步 ⇒ `status="completed"`。
-- `failed`：`status="compensated"`，`compensated` = 本步及之前所有**带补偿**的步骤名**逆序**。
+- `succeeded`：推进到下一步（`attempt` 重置为 1，`failure` 清除）；已是最后一步 ⇒ `status="completed"`。
+- `failed`：
+  - 当前步骤配置了 `retry` 且 `attempt < maxAttempts`：实例保持 `running`，`step`/`index` 不变，
+    `attempt` 加一，`failure` 记录本步 `step` 与 `detail`，`completed`/`compensated` 不变。
+  - 否则（无 `retry`，或 `attempt` 已等于 `maxAttempts`）：`status="compensated"`，
+    `compensated` = 本步及之前所有**带补偿**的步骤名**逆序**。
 - 实例已终态（completed/compensated）再发事件 ⇒ **`409 invalid_transition`**；`outcome` 非法 ⇒ `400`。
 
 #### 事件幂等（可选 `eventId`）
@@ -56,7 +64,7 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 - 并发提交同一实例的事件等价于某个确定的串行顺序；同一 `eventId` 并发时一个请求完成首次处理，
   其余请求得到首次响应。
 - 新表以 `CREATE TABLE IF NOT EXISTS` 建立，旧 SQLite 文件直接可读；旧实例带上 `eventId`
-  后照常读取与推进。
+  后照常读取与推进。不含 `attempt` 字段的旧实例状态直接可读，首次推进时按 `attempt=1` 补齐。
 
 ### `GET /v1/instances/{id}`
 `200 {"id","workflow","state"}`；未知 id ⇒ `404 not_found`。
@@ -69,5 +77,5 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 
 ## 未实现（后续任务候选，非固定题单）
 
-步骤级重试策略、超时与死信、并发与抢占、外部事件等待、编排版本迁移与在飞实例、分区与顺序保证、
+超时与死信、并发与抢占、外部事件等待、编排版本迁移与在飞实例、分区与顺序保证、
 持久化恢复与重放、限流与背压、可视化查询与审计回放、失败注入测试。
