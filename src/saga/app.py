@@ -47,6 +47,20 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
 _UNSET = object()
 
 
+def _validate_retry(retry: Any, index: int) -> dict[str, Any]:
+    if not isinstance(retry, dict):
+        raise InvalidRequest(f"steps[{index}].retry must be an object")
+    if set(retry) - {"maxAttempts"}:
+        raise InvalidRequest(f"steps[{index}].retry allows only maxAttempts")
+    if "maxAttempts" not in retry:
+        raise InvalidRequest(f"steps[{index}].retry.maxAttempts is required")
+    max_attempts = retry["maxAttempts"]
+    # bool is a subclass of int; reject it explicitly.
+    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or not 2 <= max_attempts <= 10:
+        raise InvalidRequest(f"steps[{index}].retry.maxAttempts must be an integer between 2 and 10")
+    return {"maxAttempts": max_attempts}
+
+
 def validate_workflow(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise InvalidRequest("body must be a JSON object")
@@ -57,19 +71,22 @@ def validate_workflow(payload: Any) -> dict[str, Any]:
         raise InvalidRequest("steps must be an array of 1..20 items")
     cleaned = []
     for index, step in enumerate(steps):
-        if not isinstance(step, dict) or set(step) - {"name", "compensation"}:
-            raise InvalidRequest(f"steps[{index}] must be an object with name/compensation")
+        if not isinstance(step, dict) or set(step) - {"name", "compensation", "retry"}:
+            raise InvalidRequest(f"steps[{index}] must be an object with name/compensation/retry")
         name, compensation = step.get("name"), step.get("compensation")
         if not isinstance(name, str) or not name or len(name) > 100:
             raise InvalidRequest(f"steps[{index}].name must be a non-empty string of at most 100 characters")
         if compensation is not None and (not isinstance(compensation, str) or not compensation):
             raise InvalidRequest(f"steps[{index}].compensation must be a non-empty string when present")
-        cleaned.append({"name": name, "compensation": compensation})
+        cleaned_step: dict[str, Any] = {"name": name, "compensation": compensation}
+        if "retry" in step:
+            cleaned_step["retry"] = _validate_retry(step["retry"], index)
+        cleaned.append(cleaned_step)
     return {"steps": cleaned}
 
 
 def initial_state(workflow: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
-    return {"status": "running", "step": workflow["steps"][0]["name"], "index": 0,
+    return {"status": "running", "step": workflow["steps"][0]["name"], "index": 0, "attempt": 1,
             "completed": [], "compensated": [], "context": dict(context), "failure": None}
 
 
@@ -81,9 +98,20 @@ def apply_outcome(workflow: dict[str, Any], state: dict[str, Any], outcome: str,
         raise InvalidRequest("outcome must be 'succeeded' or 'failed'")
     steps = workflow["steps"]
     index = int(state["index"])
+    # States persisted by older builds predate ``attempt``; the first advance treats
+    # such an instance as being on its first attempt of the current step.
+    attempt = int(state.get("attempt", 1))
     next_state = json.loads(json.dumps(state))
+    next_state["attempt"] = attempt
     if outcome == "failed":
+        retry = steps[index].get("retry")
+        max_attempts = int(retry["maxAttempts"]) if retry else 1
         next_state["failure"] = {"step": steps[index]["name"], "detail": detail}
+        if attempt < max_attempts:
+            # Transient failure: stay on the same step and try again. status, step,
+            # index, completed and compensated are all left untouched.
+            next_state["attempt"] = attempt + 1
+            return next_state
         pending = [s["compensation"] for s in steps[: index + 1] if s.get("compensation")]
         next_state["compensated"] = list(reversed(pending))
         next_state["completed"] = state["completed"]
@@ -92,6 +120,8 @@ def apply_outcome(workflow: dict[str, Any], state: dict[str, Any], outcome: str,
         return next_state
     completed = list(state["completed"]) + [steps[index]["name"]]
     next_state["completed"] = completed
+    next_state["failure"] = None
+    next_state["attempt"] = 1
     if index + 1 >= len(steps):
         next_state["status"] = "completed"
         next_state["step"] = None
@@ -220,7 +250,11 @@ class Engine:
             row = self._db.execute("SELECT workflow, state FROM instances WHERE id = ?", (instance_id,)).fetchone()
         if row is None:
             raise InstanceNotFound(f"no instance {instance_id}")
-        return {"id": instance_id, "workflow": row[0], "state": json.loads(row[1])}
+        state = json.loads(row[1])
+        # Legacy rows predate ``attempt``; present the default without mutating the
+        # file -- the first advance is what persists it.
+        state.setdefault("attempt", 1)
+        return {"id": instance_id, "workflow": row[0], "state": state}
 
 
 def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:

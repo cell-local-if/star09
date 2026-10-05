@@ -398,5 +398,285 @@ class IdempotencyHttpTests(unittest.TestCase):
                                    {"outcome": "succeeded", "eventId": "other"})[0], 409)
 
 
+class RetryTransitionTests(unittest.TestCase):
+    """Pure state-machine semantics for step-level retry."""
+
+    def _workflow(self, *retries):
+        steps = [
+            {"name": "a", "compensation": "undo-a"},
+            {"name": "b", "compensation": "undo-b"},
+            {"name": "c", "compensation": "undo-c"},
+        ]
+        for index, retry in enumerate(retries):
+            if retry is not None:
+                steps[index]["retry"] = {"maxAttempts": retry}
+        return {"steps": steps}
+
+    def test_initial_state_starts_at_attempt_one(self) -> None:
+        state = initial_state(self._workflow(3), {})
+        self.assertEqual(state["attempt"], 1)
+
+    def test_failure_below_max_keeps_running_and_increments_attempt(self) -> None:
+        wf = self._workflow(3)
+        state = initial_state(wf, {})
+        state = apply_outcome(wf, state, "failed", {"reason": "transient"})
+        self.assertEqual(state["status"], "running")
+        self.assertEqual((state["step"], state["index"]), ("a", 0))
+        self.assertEqual(state["attempt"], 2)
+        self.assertEqual(state["failure"], {"step": "a", "detail": {"reason": "transient"}})
+        self.assertEqual(state["compensated"], [])
+        self.assertEqual(state["completed"], [])
+        state = apply_outcome(wf, state, "failed", {"reason": "again"})
+        self.assertEqual(state["attempt"], 3)
+        self.assertEqual(state["failure"]["detail"], {"reason": "again"})
+        self.assertEqual(state["status"], "running")
+
+    def test_failure_at_max_attempt_compensates_in_reverse_order(self) -> None:
+        wf = self._workflow(2, 2)
+        state = initial_state(wf, {})
+        state = apply_outcome(wf, state, "succeeded")  # a done, attempt reset on b
+        self.assertEqual(state["step"], "b")
+        self.assertEqual(state["attempt"], 1)
+        state = apply_outcome(wf, state, "failed")  # b attempt 2
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["attempt"], 2)
+        state = apply_outcome(wf, state, "failed", {"reason": "dead"})  # exhausted
+        self.assertEqual(state["status"], "compensated")
+        self.assertIsNone(state["step"])
+        self.assertEqual(state["compensated"], ["undo-b", "undo-a"])
+        self.assertEqual(state["failure"], {"step": "b", "detail": {"reason": "dead"}})
+
+    def test_retry_then_success_advances_clears_failure_and_resets_attempt(self) -> None:
+        wf = self._workflow(3)
+        state = initial_state(wf, {})
+        state = apply_outcome(wf, state, "failed", {"reason": "x"})
+        self.assertEqual(state["attempt"], 2)
+        state = apply_outcome(wf, state, "succeeded")
+        self.assertEqual(state["completed"], ["a"])
+        self.assertIsNone(state["failure"])
+        self.assertEqual((state["step"], state["index"], state["attempt"]), ("b", 1, 1))
+
+    def test_step_without_retry_compensates_on_first_failure(self) -> None:
+        wf = self._workflow(None)
+        state = initial_state(wf, {})
+        state = apply_outcome(wf, state, "failed", {"reason": "nope"})
+        self.assertEqual(state["status"], "compensated")
+        self.assertEqual(state["compensated"], ["undo-a"])
+
+    def test_legacy_state_without_attempt_is_treated_as_attempt_one(self) -> None:
+        wf = self._workflow(2)
+        state = initial_state(wf, {})
+        del state["attempt"]
+        state = apply_outcome(wf, state, "failed")
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["attempt"], 2)
+        # Same legacy state on a workflow without retry compensates immediately.
+        wf_no_retry = self._workflow(None)
+        state = initial_state(wf_no_retry, {})
+        del state["attempt"]
+        state = apply_outcome(wf_no_retry, state, "failed")
+        self.assertEqual(state["status"], "compensated")
+
+    def test_retry_validation_rejects_bad_shapes(self) -> None:
+        engine = Engine()
+        try:
+            base_step = {"name": "a", "compensation": "undo-a"}
+            bad_retries = [
+                {"maxAttempts": 1}, {"maxAttempts": 11}, {"maxAttempts": 2.0},
+                {"maxAttempts": "2"}, {"maxAttempts": True}, {"maxAttempts": None},
+                {}, {"maxAttempts": 2, "extra": 1}, "nope",
+            ]
+            for retry in bad_retries:
+                step = dict(base_step, retry=retry)
+                with self.assertRaises(InvalidRequest):
+                    engine.define("bad", {"steps": [step]})
+            # A rejected definition must not replace an existing valid one.
+            engine.define("keep", {"steps": [dict(base_step)]})
+            with self.assertRaises(InvalidRequest):
+                engine.define("keep", {"steps": [dict(base_step, retry={"maxAttempts": 1})]})
+            self.assertEqual(engine.workflow("keep")["steps"], [dict(base_step)])
+            # Valid boundaries are accepted and echoed back.
+            for value in (2, 10):
+                wf = engine.define(f"ok-{value}", {"steps": [dict(base_step, retry={"maxAttempts": value})]})
+                self.assertEqual(wf["steps"][0]["retry"], {"maxAttempts": value})
+        finally:
+            engine.close()
+
+
+class RetryEngineTests(unittest.TestCase):
+    """Engine/ledger interaction with retries."""
+
+    def setUp(self) -> None:
+        self.engine = Engine()
+        self.engine.define(
+            "retried",
+            {"steps": [
+                {"name": "a", "compensation": "undo-a", "retry": {"maxAttempts": 3}},
+                {"name": "b", "compensation": "undo-b"},
+            ]},
+        )
+
+    def tearDown(self) -> None:
+        self.engine.close()
+
+    def _start(self) -> str:
+        return self.engine.start("retried", {})["id"]
+
+    def test_each_failed_attempt_with_distinct_event_id_persists(self) -> None:
+        iid = self._start()
+        first = self.engine.advance(iid, "failed", {"n": 1}, event_id="fail-1")
+        self.assertEqual((first["state"]["attempt"], first["state"]["status"]), (2, "running"))
+        second = self.engine.advance(iid, "failed", {"n": 2}, event_id="fail-2")
+        self.assertEqual(second["state"]["attempt"], 3)
+        self.assertEqual(second["state"]["failure"]["detail"], {"n": 2})
+        # Replaying the first failure returns the historical attempt=2 state even
+        # though the instance has since moved on to attempt 3.
+        replay = self.engine.advance(iid, "failed", {"n": 1}, event_id="fail-1")
+        self.assertEqual(replay, first)
+        self.assertEqual(self.engine.get(iid)["state"]["attempt"], 3)
+
+    def test_replay_of_retry_failure_does_not_increment_attempt_twice(self) -> None:
+        iid = self._start()
+        self.engine.advance(iid, "failed", event_id="fail-1")
+        replay = self.engine.advance(iid, "failed", event_id="fail-1")
+        self.assertEqual(replay["state"]["attempt"], 2)
+        self.assertEqual(self.engine.get(iid)["state"]["attempt"], 2)
+        rows = self.engine._db.execute("SELECT COUNT(*) FROM instance_events").fetchone()[0]
+        self.assertEqual(rows, 1)
+
+    def test_replayed_failure_with_different_detail_is_409(self) -> None:
+        iid = self._start()
+        self.engine.advance(iid, "failed", {"n": 1}, event_id="fail-1")
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "failed", {"n": 2}, event_id="fail-1")
+        self.assertEqual(self.engine.get(iid)["state"]["attempt"], 2)
+
+    def test_exhaustion_then_new_event_on_terminal_is_409_and_writes_nothing(self) -> None:
+        iid = self._start()
+        self.engine.advance(iid, "failed", event_id="f1")  # attempt 2
+        self.engine.advance(iid, "failed", event_id="f2")  # attempt 3
+        final = self.engine.advance(iid, "failed", {"reason": "last"}, event_id="f3")
+        self.assertEqual(final["state"]["status"], "compensated")
+        self.assertEqual(final["state"]["compensated"], ["undo-a"])
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="after")
+        rows = {r[0] for r in self.engine._db.execute(
+            "SELECT event_id FROM instance_events WHERE instance_id = ?", (iid,)).fetchall()}
+        self.assertEqual(rows, {"f1", "f2", "f3"})
+
+    def test_attempt_survives_reopen(self) -> None:
+        fd, path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        try:
+            engine = Engine(path)
+            engine.define(
+                "retried",
+                {"steps": [{"name": "a", "compensation": "undo-a", "retry": {"maxAttempts": 2}}]},
+            )
+            iid = engine.start("retried", {})["id"]
+            engine.advance(iid, "failed", event_id="f1")
+            engine.close()
+
+            engine = Engine(path)
+            try:
+                # Definitions are in-memory (baseline behavior); re-register before advancing.
+                engine.define(
+                    "retried",
+                    {"steps": [{"name": "a", "compensation": "undo-a", "retry": {"maxAttempts": 2}}]},
+                )
+                state = engine.get(iid)["state"]
+                self.assertEqual((state["attempt"], state["status"]), (2, "running"))
+                exhausted = engine.advance(iid, "failed", event_id="f2")
+                self.assertEqual(exhausted["state"]["status"], "compensated")
+            finally:
+                engine.close()
+        finally:
+            os.unlink(path)
+
+    def test_legacy_instance_gets_attempt_on_read_and_first_advance(self) -> None:
+        fd, path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        try:
+            legacy = sqlite3.connect(path)
+            legacy.execute("CREATE TABLE instances (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, state TEXT NOT NULL)")
+            # A "retried" workflow definition is registered at runtime, so seed an
+            # instance mid-step on the built-in order workflow (no retry): the
+            # backfill must still present attempt=1 and behave as before.
+            state = initial_state(WORKFLOWS["order"], {})
+            state = apply_outcome(WORKFLOWS["order"], state, "succeeded")
+            legacy.execute("INSERT INTO instances VALUES (?, ?, ?)", ("old", "order", json.dumps(state)))
+            legacy.commit()
+            legacy.close()
+
+            engine = Engine(path)
+            try:
+                self.assertEqual(engine.get("old")["state"]["attempt"], 1)
+                result = engine.advance("old", "failed", event_id="e1")
+                self.assertEqual(result["state"]["status"], "compensated")
+                self.assertEqual(result["state"]["compensated"], ["refund-payment", "release-stock"])
+            finally:
+                engine.close()
+        finally:
+            os.unlink(path)
+
+
+class RetryHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from saga import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def call(self, method: str, path: str, body: dict | None = None):
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def test_retry_definition_and_failure_loop_over_http(self) -> None:
+        definition = {"steps": [
+            {"name": "a", "compensation": "undo-a", "retry": {"maxAttempts": 2}},
+            {"name": "b", "compensation": "undo-b"},
+        ]}
+        self.assertEqual(self.call("PUT", "/v1/workflows/flaky", definition)[0], 200)
+        status, body = self.call("POST", "/v1/workflows/flaky/instances", {})
+        self.assertEqual(status, 201)
+        self.assertEqual(body["state"]["attempt"], 1)
+        iid = body["id"]
+        status, body = self.call("POST", f"/v1/instances/{iid}/events",
+                                 {"outcome": "failed", "detail": {"why": "blip"}, "eventId": "f1"})
+        self.assertEqual(status, 200)
+        self.assertEqual((body["state"]["status"], body["state"]["attempt"]), ("running", 2))
+        # Verbatim replay of the not-yet-retried historical response.
+        status, replay = self.call("POST", f"/v1/instances/{iid}/events",
+                                   {"outcome": "failed", "detail": {"why": "blip"}, "eventId": "f1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(replay, body)
+        status, body = self.call("POST", f"/v1/instances/{iid}/events",
+                                 {"outcome": "succeeded", "eventId": "ok"})
+        self.assertEqual(status, 200)
+        self.assertEqual((body["state"]["step"], body["state"]["attempt"]), ("b", 1))
+        self.assertIsNone(body["state"]["failure"])
+
+    def test_invalid_retry_definitions_are_400(self) -> None:
+        step = {"name": "a", "compensation": "undo-a"}
+        for bad_retry in ({"maxAttempts": 1}, {"maxAttempts": 11}, {"maxAttempts": True},
+                          {"maxAttempts": 2.5}, {}, {"maxAttempts": 2, "x": 1}):
+            status, body = self.call("PUT", "/v1/workflows/bad-retry",
+                                    {"steps": [dict(step, retry=bad_retry)]})
+            self.assertEqual(status, 400, bad_retry)
+            self.assertEqual(body["error"]["code"], "invalid_request")
+
+
 if __name__ == "__main__":
     unittest.main()

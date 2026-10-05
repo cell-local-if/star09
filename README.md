@@ -1,7 +1,7 @@
-# Saga Orchestrator — 公开契约（baseline）
+# Saga Orchestrator — 公开契约
 
 **任务编排与补偿**服务：工作流 = 一串步骤，每步可带一个补偿动作；某步失败时，**已完成步骤的补偿按逆序执行**。
-本次基线只实现最小可用子集，后续任务在此契约之上继续建设。
+步骤可配置有限重试：短暂失败后停留本步重试若干次，重试耗尽才进入补偿。
 
 ## 运行
 
@@ -15,9 +15,12 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 ## 概念
 
 - **工作流定义**：`{"steps":[{"name":"reserve-stock","compensation":"release-stock"}, ...]}`（1–20 步）。
+  每步可带可选 `"retry":{"maxAttempts": <2..10 的整数>}`；不带 `retry` 的步骤保持失败即补偿。
 - **实例状态**：`{"status":"running|completed|compensated", "step": <当前步骤名或 null>, "index": <int>,
+  "attempt": <当前步骤的尝试序号，从 1 开始>,
   "completed":[<已完成步骤名>], "compensated":[<将/已执行的补偿名，逆序>], "context": {...}, "failure": null|{...}}`。
 - 状态转移是**纯函数**：同样的 `(状态, outcome)` 永远得到同样的下一个状态。
+- 不带 `attempt` 的旧状态可直接读取（视为 1），首次推进时随新状态持久化补齐。
 
 ## 接口
 
@@ -30,6 +33,8 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 ### `PUT /v1/workflows/{name}`
 请求体 = 工作流定义 → `200 {"workflow": name, "steps": [...]}`。
 定义非法（step 非对象、`name` 空/超 100 字符、未知字段、步数越界）⇒ `400 invalid_request`。
+`retry` 只允许 `maxAttempts`，且必须是 2–10 的整数；缺字段、含未知字段、布尔值、非整数、
+越界或 `retry` 本身不是对象 ⇒ `400 invalid_request`，已有定义保持不变。
 
 ### `POST /v1/workflows/{name}/instances`
 请求体：`{"context": {...}}`（可省）→ **`201`** `{"id": <uuid>, "workflow": name, "state": {...}}`。
@@ -37,9 +42,17 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 ### `POST /v1/instances/{id}/events`
 请求体：`{"outcome": "succeeded"|"failed", "detail": <任意 JSON>, "eventId": "<可选>"}` →
 `200 {"id":..., "workflow":..., "state": {...}}`。
-- `succeeded`：推进到下一步；已是最后一步 ⇒ `status="completed"`。
-- `failed`：`status="compensated"`，`compensated` = 本步及之前所有**带补偿**的步骤名**逆序**。
+- `succeeded`：推进到下一步（`attempt` 重置为 1、`failure` 清除）；已是最后一步 ⇒ `status="completed"`。
+- `failed`：
+  - 当前步骤配置了 `retry` 且 `attempt < maxAttempts`：实例继续 `running`，`step`/`index` 不变，
+    `attempt` 加一；`failure={"step": 当前步骤, "detail": ...}` 记录本步失败；
+    `completed`、`compensated` 不变。
+  - 否则（无 `retry`，或 `attempt` 已等于 `maxAttempts`）：`status="compensated"`，
+    `compensated` = 本步及之前所有**带补偿**的步骤名**逆序**。
 - 实例已终态（completed/compensated）再发事件 ⇒ **`409 invalid_transition`**；`outcome` 非法 ⇒ `400`。
+- 每次失败提交（包括尚未耗尽重试、实例仍为 `running` 的提交）都正常进入 `eventId` 幂等账本；
+  相同 `eventId` 重放返回那次提交的完整历史响应（其中的 `state` 停留在当时的 `attempt`，
+  即使之后已继续重试或推进）。
 
 #### 事件幂等（可选 `eventId`）
 - 不带 `eventId`：行为不变，每次调用都重新进入状态机（终态实例仍返回 `409`）。
@@ -69,5 +82,5 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 
 ## 未实现（后续任务候选，非固定题单）
 
-步骤级重试策略、超时与死信、并发与抢占、外部事件等待、编排版本迁移与在飞实例、分区与顺序保证、
+超时与死信、并发与抢占、外部事件等待、编排版本迁移与在飞实例、分区与顺序保证、
 持久化恢复与重放、限流与背压、可视化查询与审计回放、失败注入测试。
