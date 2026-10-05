@@ -43,6 +43,9 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
     ]},
 }
 
+# Sentinel: distinguishes "eventId not carried" (baseline behavior) from an explicit null.
+_UNSET = object()
+
 
 def validate_workflow(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
@@ -106,6 +109,15 @@ class Engine:
         self._lock = threading.RLock()
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.execute("CREATE TABLE IF NOT EXISTS instances (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, state TEXT NOT NULL)")
+        # Idempotent event ledger: one row per (instance, eventId). IF NOT EXISTS keeps
+        # files created by older builds readable; old instances simply start with an
+        # empty ledger and can accept eventIds on their next advance.
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS instance_events ("
+            "instance_id TEXT NOT NULL, event_id TEXT NOT NULL, "
+            "request TEXT NOT NULL, response TEXT NOT NULL, "
+            "PRIMARY KEY (instance_id, event_id))"
+        )
         self._db.commit()
         self._workflows: dict[str, dict[str, Any]] = dict(WORKFLOWS)
 
@@ -138,16 +150,70 @@ class Engine:
             self._db.commit()
         return {"id": instance_id, "workflow": name, "state": state}
 
-    def advance(self, instance_id: str, outcome: Any, detail: Any = None) -> dict[str, Any]:
+    def advance(self, instance_id: str, outcome: Any, detail: Any = None, event_id: Any = _UNSET) -> dict[str, Any]:
+        """Apply one event atomically.
+
+        Without event_id the behavior is the baseline: every call re-enters the state
+        machine, so a terminal instance raises InvalidTransition. With an event_id the
+        (instance_id, event_id) pair is idempotent: a repeat with an equal normalized
+        request returns the first response verbatim (including its historical state)
+        without touching the instance state; a repeat whose outcome/detail differs
+        raises InvalidTransition. Nothing is written to the ledger unless the transition
+        succeeds.
+        """
+        normalized = None
+        if event_id is not _UNSET:
+            normalized = self._normalize_event_request(event_id, outcome, detail)
+            event_id = normalized["eventId"]
         with self._lock:
             row = self._db.execute("SELECT workflow, state FROM instances WHERE id = ?", (instance_id,)).fetchone()
             if row is None:
                 raise InstanceNotFound(f"no instance {instance_id}")
+            if normalized is not None:
+                ledger = self._db.execute(
+                    "SELECT request, response FROM instance_events WHERE instance_id = ? AND event_id = ?",
+                    (instance_id, event_id),
+                ).fetchone()
+                if ledger is not None:
+                    stored_request, stored_response = ledger
+                    if stored_request != json.dumps(normalized, separators=(",", ":"), sort_keys=True):
+                        raise InvalidTransition(
+                            f"eventId {event_id!r} was already submitted for this instance with a different outcome/detail"
+                        )
+                    return json.loads(stored_response)
             workflow = self.workflow(row[0])
             state = apply_outcome(workflow, json.loads(row[1]), outcome, detail)
-            self._db.execute("UPDATE instances SET state = ? WHERE id = ?", (json.dumps(state), instance_id))
+            response = {"id": instance_id, "workflow": row[0], "state": state}
+            if normalized is None:
+                self._db.execute("UPDATE instances SET state = ? WHERE id = ?", (json.dumps(state), instance_id))
+            else:
+                # Transition and ledger insert commit together; the primary key makes a
+                # racing duplicate insert fail, and the lock above serializes it anyway.
+                self._db.execute("UPDATE instances SET state = ? WHERE id = ?", (json.dumps(state), instance_id))
+                self._db.execute(
+                    "INSERT INTO instance_events (instance_id, event_id, request, response) VALUES (?, ?, ?, ?)",
+                    (instance_id, event_id,
+                     json.dumps(normalized, separators=(",", ":"), sort_keys=True),
+                     json.dumps(response)),
+                )
             self._db.commit()
-        return {"id": instance_id, "workflow": row[0], "state": state}
+        return response
+
+    @staticmethod
+    def _normalize_event_request(event_id: Any, outcome: Any, detail: Any) -> dict[str, Any]:
+        """Validate eventId and produce the canonical request used for replay comparison.
+
+        A missing detail and an explicit null detail are the same value, so the
+        normalized form always carries ``"detail": null`` unless a detail was given.
+        """
+        if not isinstance(event_id, str) or not event_id or len(event_id) > 100:
+            raise InvalidRequest("eventId must be a non-empty string of at most 100 characters")
+        normalized: dict[str, Any] = {"eventId": event_id, "outcome": outcome}
+        if detail is not None:
+            normalized["detail"] = detail
+        else:
+            normalized["detail"] = None
+        return normalized
 
     def get(self, instance_id: str) -> dict[str, Any]:
         with self._lock:
@@ -230,9 +296,14 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                     return self._send(201, engine.start(parts[2], body.get("context")))
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "events":
                     body = self._read_json()
-                    if not isinstance(body, dict) or set(body) - {"outcome", "detail"}:
-                        raise InvalidRequest("body must be {\"outcome\": \"succeeded|failed\", \"detail\": ...}")
-                    return self._send(200, engine.advance(parts[2], body.get("outcome"), body.get("detail")))
+                    if not isinstance(body, dict) or set(body) - {"outcome", "detail", "eventId"}:
+                        raise InvalidRequest(
+                            'body must be {"outcome": "succeeded|failed", "detail": ..., "eventId": "..."}'
+                        )
+                    event_id = body["eventId"] if "eventId" in body else _UNSET
+                    return self._send(
+                        200, engine.advance(parts[2], body.get("outcome"), body.get("detail"), event_id)
+                    )
                 return self._send(404, {"error": {"code": "not_found"}})
             except SagaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})

@@ -35,11 +35,28 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 请求体：`{"context": {...}}`（可省）→ **`201`** `{"id": <uuid>, "workflow": name, "state": {...}}`。
 
 ### `POST /v1/instances/{id}/events`
-请求体：`{"outcome": "succeeded"|"failed", "detail": <任意 JSON>}` →
+请求体：`{"outcome": "succeeded"|"failed", "detail": <任意 JSON>, "eventId": "<可选>"}` →
 `200 {"id":..., "workflow":..., "state": {...}}`。
 - `succeeded`：推进到下一步；已是最后一步 ⇒ `status="completed"`。
 - `failed`：`status="compensated"`，`compensated` = 本步及之前所有**带补偿**的步骤名**逆序**。
 - 实例已终态（completed/compensated）再发事件 ⇒ **`409 invalid_transition`**；`outcome` 非法 ⇒ `400`。
+
+#### 事件幂等（可选 `eventId`）
+- 不带 `eventId`：行为不变，每次调用都重新进入状态机（终态实例仍返回 `409`）。
+- `eventId` 必须是**非空字符串且 ≤100 字符**；为 `null`、空串、非字符串或超长 ⇒ `400 invalid_request`。
+- `eventId` 仅在**单个实例范围内**唯一；不同实例可复用相同标识。
+- 首次合法事件：原子地推进状态，并把事件标识、归一化请求（`eventId`/`outcome`/`detail`；
+  省略 `detail` 与显式 `null` 视为相同值）和该次处理的**完整 JSON 响应**写入实例事件账本
+  （SQLite 表 `instance_events`，与实例状态同库同事务；服务重开同一文件后仍可命中）。
+- 相同 `(实例, eventId)` 再次提交：
+  - `outcome` 相同且 `detail` 的 JSON 值相同 ⇒ 返回**首次处理的 200 响应原文**（含当时的
+    `state`），不改变当前状态，不重复累计 `completed`/`compensated`/`failure`（终态后回放仍返回 200）。
+  - `outcome` 或 `detail` 不同 ⇒ **`409 invalid_transition`**，状态不变。
+- 非法 `outcome`、终态推进、不存在实例的请求**不写账本**。
+- 并发提交同一实例的事件等价于某个确定的串行顺序；同一 `eventId` 并发时一个请求完成首次处理，
+  其余请求得到首次响应。
+- 新表以 `CREATE TABLE IF NOT EXISTS` 建立，旧 SQLite 文件直接可读；旧实例带上 `eventId`
+  后照常读取与推进。
 
 ### `GET /v1/instances/{id}`
 `200 {"id","workflow","state"}`；未知 id ⇒ `404 not_found`。
@@ -52,5 +69,5 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 
 ## 未实现（后续任务候选，非固定题单）
 
-步骤重试与幂等键、超时与死信、并发与抢占、外部事件等待、编排版本迁移与在飞实例、分区与顺序保证、
+步骤级重试策略、超时与死信、并发与抢占、外部事件等待、编排版本迁移与在飞实例、分区与顺序保证、
 持久化恢复与重放、限流与背压、可视化查询与审计回放、失败注入测试。
