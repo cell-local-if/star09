@@ -6,6 +6,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -1342,6 +1343,461 @@ class AuditHttpTests(unittest.TestCase):
         status, body = self.call("GET", "/v1/instances/missing/audit")
         self.assertEqual(status, 404)
         self.assertEqual(body["error"]["code"], "not_found")
+
+
+class AwaitTimeoutDefinitionTests(unittest.TestCase):
+    """Validation of the optional timeoutMs field on a step's await object."""
+
+    def setUp(self) -> None:
+        self.engine = Engine()
+
+    def tearDown(self) -> None:
+        self.engine.close()
+
+    def test_valid_timeout_boundaries_accepted_and_round_trip(self) -> None:
+        for timeout in (1, 60_000, 86_400_000):
+            workflow = self.engine.define(
+                f"w-{timeout}", {"steps": [{"name": "a", "await": {"event": "go", "timeoutMs": timeout}}]}
+            )
+            self.assertEqual(workflow["steps"][0]["await"], {"event": "go", "timeoutMs": timeout})
+
+    def test_await_without_timeout_keeps_baseline_shape(self) -> None:
+        workflow = self.engine.define("plain", {"steps": [{"name": "a", "await": {"event": "go"}}]})
+        self.assertEqual(workflow["steps"][0]["await"], {"event": "go"})
+
+    def test_invalid_timeout_shapes_are_400_and_keep_existing_definition(self) -> None:
+        self.engine.define("w", {"steps": [{"name": "a", "await": {"event": "go", "timeoutMs": 10}}]})
+        bad_awaits = [
+            {"event": "go", "timeoutMs": True},      # boolean
+            {"event": "go", "timeoutMs": False},     # boolean
+            {"event": "go", "timeoutMs": 1.5},       # non-integer
+            {"event": "go", "timeoutMs": "100"},     # non-integer
+            {"event": "go", "timeoutMs": None},      # null
+            {"event": "go", "timeoutMs": 0},         # below range
+            {"event": "go", "timeoutMs": -1},        # below range
+            {"event": "go", "timeoutMs": 86_400_001},  # above range
+            {"event": "go", "timeoutMs": 10, "x": 1},  # unknown field
+            {"timeoutMs": 10},                       # missing event
+        ]
+        for bad in bad_awaits:
+            with self.assertRaises(InvalidRequest, msg=repr(bad)):
+                self.engine.define("w", {"steps": [{"name": "a", "await": bad}]})
+        self.assertEqual(
+            self.engine.workflow("w")["steps"][0]["await"], {"event": "go", "timeoutMs": 10}
+        )
+
+
+def _timeout_workflow() -> dict:
+    return {
+        "steps": [
+            {"name": "ask", "compensation": "cancel-ask",
+             "await": {"event": "approved", "timeoutMs": 5000}},
+            {"name": "do", "compensation": "undo-do"},
+            {"name": "wait-forever", "await": {"event": "never"}},
+        ]
+    }
+
+
+class TimeoutTransitionTests(unittest.TestCase):
+    """Pure state-machine transitions for wait deadlines and the timed_out outcome."""
+
+    def setUp(self) -> None:
+        self.workflow = _timeout_workflow()
+
+    def test_waiting_step_with_timeout_sets_deadline(self) -> None:
+        state = initial_state(self.workflow, {}, now_ms=1000)
+        self.assertEqual(state["waitingFor"], "approved")
+        self.assertEqual(state["deadlineAt"], 6000)
+        self.assertEqual(state["status"], "running")
+
+    def test_wait_without_timeout_and_plain_step_have_null_deadline(self) -> None:
+        state = initial_state(self.workflow, {}, now_ms=1000)
+        state = apply_signal(self.workflow, state, "approved", now_ms=2000)
+        self.assertEqual((state["step"], state["waitingFor"], state["deadlineAt"]), ("do", None, None))
+        state = apply_outcome(self.workflow, state, "succeeded", now_ms=3000)
+        self.assertEqual(state["waitingFor"], "never")
+        self.assertIsNone(state["deadlineAt"])
+
+    def test_timed_out_before_deadline_is_409(self) -> None:
+        state = initial_state(self.workflow, {}, now_ms=1000)
+        with self.assertRaises(InvalidTransition):
+            apply_outcome(self.workflow, state, "timed_out", now_ms=5999)
+        # State is untouched by the rejected call.
+        self.assertEqual(state["deadlineAt"], 6000)
+
+    def test_timed_out_at_and_after_deadline_dead_letters(self) -> None:
+        for now in (6000, 7000):
+            state = initial_state(self.workflow, {}, now_ms=1000)
+            state = apply_outcome(self.workflow, state, "timed_out", {"why": "late"}, now_ms=now)
+            self.assertEqual(state["status"], "dead_lettered")
+            # Position and progress are preserved exactly as they were.
+            self.assertEqual((state["step"], state["index"]), ("ask", 0))
+            self.assertEqual(state["completed"], [])
+            self.assertEqual(state["compensated"], [])
+            self.assertEqual(
+                state["failure"], {"step": "ask", "reason": "timeout", "detail": {"why": "late"}}
+            )
+            self.assertIsNone(state["waitingFor"])
+            self.assertIsNone(state["deadlineAt"])
+
+    def test_timed_out_rejected_on_plain_step_and_on_wait_without_timeout(self) -> None:
+        state = initial_state(self.workflow, {}, now_ms=1000)
+        state = apply_signal(self.workflow, state, "approved", now_ms=2000)
+        with self.assertRaises(InvalidTransition):  # plain step is not waiting
+            apply_outcome(self.workflow, state, "timed_out", now_ms=10_000)
+        state = apply_outcome(self.workflow, state, "succeeded", now_ms=3000)
+        with self.assertRaises(InvalidTransition):  # waiting, but no timeoutMs
+            apply_outcome(self.workflow, state, "timed_out", now_ms=10**15)
+
+    def test_signal_before_deadline_takes_success_path_and_clears_deadline(self) -> None:
+        state = initial_state(self.workflow, {}, now_ms=1000)
+        state = apply_signal(self.workflow, state, "approved", {"by": "boss"}, now_ms=5999)
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["completed"], ["ask"])
+        self.assertIsNone(state["waitingFor"])
+        self.assertIsNone(state["deadlineAt"])
+        # The wait is over; a late timed_out no longer applies.
+        with self.assertRaises(InvalidTransition):
+            apply_outcome(self.workflow, state, "timed_out", now_ms=10**15)
+
+    def test_dead_lettered_is_terminal_for_events_signals_and_timeouts(self) -> None:
+        state = initial_state(self.workflow, {}, now_ms=1000)
+        state = apply_outcome(self.workflow, state, "timed_out", now_ms=6000)
+        self.assertEqual(state["status"], "dead_lettered")
+        for outcome in ("succeeded", "failed", "timed_out"):
+            with self.assertRaises(InvalidTransition, msg=outcome):
+                apply_outcome(self.workflow, state, outcome, now_ms=10**15)
+        with self.assertRaises(InvalidTransition):
+            apply_signal(self.workflow, state, "approved", now_ms=10**15)
+
+    def test_legacy_state_without_deadline_at_reads_as_null(self) -> None:
+        state = initial_state(self.workflow, {}, now_ms=1000)
+        del state["deadlineAt"]  # simulate a pre-timeout persisted instance
+        # A waiting legacy instance has no deadline: timed_out is refused, signals work.
+        with self.assertRaises(InvalidTransition):
+            apply_outcome(self.workflow, state, "timed_out", now_ms=10**15)
+        state = apply_signal(self.workflow, state, "approved", now_ms=2000)
+        self.assertEqual(state["completed"], ["ask"])
+
+
+class TimeoutEngineTests(unittest.TestCase):
+    """Ledger, audit and replay behavior of the timed_out outcome."""
+
+    def setUp(self) -> None:
+        self.engine = Engine()
+        self.engine.define("expiring", {"steps": [
+            {"name": "ask", "compensation": "cancel-ask",
+             "await": {"event": "approved", "timeoutMs": 1}},
+            {"name": "do", "compensation": "undo-do"},
+        ]})
+        self.engine.define("patient", {"steps": [
+            {"name": "ask", "await": {"event": "approved", "timeoutMs": 86_400_000}},
+            {"name": "do"},
+        ]})
+        self.engine.define("timeless", {"steps": [
+            {"name": "ask", "await": {"event": "approved"}},
+        ]})
+
+    def tearDown(self) -> None:
+        self.engine.close()
+
+    def _expired(self) -> str:
+        iid = self.engine.start("expiring", {})["id"]
+        time.sleep(0.02)  # let the 1ms deadline pass
+        return iid
+
+    def test_timed_out_dead_letters_and_is_audited(self) -> None:
+        iid = self._expired()
+        result = self.engine.advance(iid, "timed_out", {"why": "late"}, event_id="t-1")
+        state = result["state"]
+        self.assertEqual(state["status"], "dead_lettered")
+        self.assertEqual((state["step"], state["index"]), ("ask", 0))
+        self.assertEqual(state["failure"],
+                         {"step": "ask", "reason": "timeout", "detail": {"why": "late"}})
+        self.assertIsNone(state["waitingFor"])
+        self.assertIsNone(state["deadlineAt"])
+        history = self.engine.audit(iid)["history"]
+        self.assertEqual([h["seq"] for h in history], [1])
+        self.assertEqual(history[0]["kind"], "event")
+        self.assertEqual(history[0]["eventId"], "t-1")
+        self.assertEqual(history[0]["request"],
+                         {"eventId": "t-1", "outcome": "timed_out", "detail": {"why": "late"}})
+        self.assertEqual(history[0]["response"], result)
+
+    def test_timed_out_replay_returns_first_response_without_new_audit(self) -> None:
+        iid = self._expired()
+        first = self.engine.advance(iid, "timed_out", {"v": 1}, event_id="t-1")
+        replay = self.engine.advance(iid, "timed_out", {"v": 1}, event_id="t-1")
+        self.assertEqual(replay, first)
+        # Omitted detail equals explicit null detail.
+        iid2 = self._expired()
+        second = self.engine.advance(iid2, "timed_out", None, event_id="t-2")
+        self.assertEqual(self.engine.advance(iid2, "timed_out", event_id="t-2"), second)
+        # No state change, no extra audit rows from replays.
+        self.assertEqual(self.engine.get(iid)["state"]["status"], "dead_lettered")
+        self.assertEqual(len(self.engine.audit(iid)["history"]), 1)
+        self.assertEqual(
+            self.engine._db.execute(
+                "SELECT COUNT(*) FROM instance_events WHERE instance_id = ?", (iid,)
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_same_event_id_with_different_payload_is_409_and_writes_nothing(self) -> None:
+        iid = self._expired()
+        self.engine.advance(iid, "timed_out", {"v": 1}, event_id="t-1")
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "timed_out", {"v": 2}, event_id="t-1")
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "failed", {"v": 1}, event_id="t-1")
+        rows = self.engine._db.execute(
+            "SELECT COUNT(*) FROM instance_events WHERE instance_id = ?", (iid,)
+        ).fetchone()[0]
+        self.assertEqual(rows, 1)
+        self.assertEqual(len(self.engine.audit(iid)["history"]), 1)
+
+    def test_rejected_timed_out_calls_write_no_ledger_or_audit(self) -> None:
+        patient = self.engine.start("patient", {})["id"]      # deadline far in the future
+        timeless = self.engine.start("timeless", {})["id"]    # wait without timeoutMs
+        plain = self.engine.start("order", {})["id"]          # not waiting at all
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(patient, "timed_out", event_id="r-1")
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(timeless, "timed_out", event_id="r-2")
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(plain, "timed_out", event_id="r-3")
+        with self.assertRaises(InstanceNotFound):
+            self.engine.advance("missing", "timed_out", event_id="r-4")
+        with self.assertRaises(InvalidRequest):
+            self.engine.advance(patient, "bogus", event_id="r-5")
+        self.assertEqual(
+            self.engine._db.execute("SELECT COUNT(*) FROM instance_events").fetchone()[0], 0
+        )
+        for iid in (patient, timeless, plain):
+            self.assertEqual(self.engine.audit(iid)["history"], [])
+            self.assertEqual(self.engine.get(iid)["state"]["status"], "running")
+
+    def test_timed_out_on_terminal_instance_is_409(self) -> None:
+        iid = self._expired()
+        self.engine.advance(iid, "timed_out", event_id="t-1")
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "timed_out", event_id="t-2")
+        self.assertEqual(len(self.engine.audit(iid)["history"]), 1)
+
+    def test_anonymous_timed_out_audited_without_ledger_row(self) -> None:
+        iid = self._expired()
+        result = self.engine.advance(iid, "timed_out")
+        self.assertEqual(result["state"]["status"], "dead_lettered")
+        self.assertEqual(
+            self.engine._db.execute("SELECT COUNT(*) FROM instance_events").fetchone()[0], 0
+        )
+        history = self.engine.audit(iid)["history"]
+        self.assertEqual([h["seq"] for h in history], [1])
+        self.assertEqual(history[0]["request"],
+                         {"eventId": None, "outcome": "timed_out", "detail": None})
+
+    def test_signal_before_deadline_still_succeeds_via_engine(self) -> None:
+        iid = self.engine.start("patient", {})["id"]
+        deadline = self.engine.get(iid)["state"]["deadlineAt"]
+        self.assertIsInstance(deadline, int)
+        result = self.engine.signal(iid, "approved")
+        self.assertEqual(result["state"]["completed"], ["ask"])
+        self.assertIsNone(result["state"]["deadlineAt"])
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "timed_out")
+
+
+class TimeoutPersistenceTests(unittest.TestCase):
+    """deadlineAt, dead_lettered state, failure and replay survive reopen."""
+
+    def setUp(self) -> None:
+        fd, self.path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+
+    def tearDown(self) -> None:
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+    @staticmethod
+    def _define(engine: Engine) -> None:
+        engine.define("expiring", {"steps": [
+            {"name": "ask", "await": {"event": "approved", "timeoutMs": 1}},
+            {"name": "do"},
+        ]})
+        engine.define("patient", {"steps": [
+            {"name": "ask", "await": {"event": "approved", "timeoutMs": 86_400_000}},
+        ]})
+
+    def test_deadline_and_dead_letter_replay_consistent_across_reopen(self) -> None:
+        engine = Engine(self.path)
+        self._define(engine)
+        waiting = engine.start("patient", {})["id"]
+        deadline = engine.get(waiting)["state"]["deadlineAt"]
+        expiring = engine.start("expiring", {})["id"]
+        time.sleep(0.02)
+        first = engine.advance(expiring, "timed_out", {"why": "late"}, event_id="t-1")
+        engine.close()
+
+        engine = Engine(self.path)
+        try:
+            self._define(engine)
+            # The waiting instance kept its exact deadline.
+            self.assertEqual(engine.get(waiting)["state"]["deadlineAt"], deadline)
+            with self.assertRaises(InvalidTransition):
+                engine.advance(waiting, "timed_out", event_id="t-9")
+            # The dead-lettered instance kept status, position and failure...
+            state = engine.get(expiring)["state"]
+            self.assertEqual(state["status"], "dead_lettered")
+            self.assertEqual((state["step"], state["index"]), ("ask", 0))
+            self.assertEqual(state["failure"],
+                             {"step": "ask", "reason": "timeout", "detail": {"why": "late"}})
+            # ...and the timed_out event replays the first response verbatim.
+            self.assertEqual(engine.advance(expiring, "timed_out", {"why": "late"}, event_id="t-1"),
+                             first)
+            with self.assertRaises(InvalidTransition):
+                engine.advance(expiring, "timed_out", {"why": "other"}, event_id="t-1")
+            # Audit history survived too.
+            history = engine.audit(expiring)["history"]
+            self.assertEqual([h["seq"] for h in history], [1])
+            self.assertEqual(history[0]["request"]["outcome"], "timed_out")
+            self.assertEqual(history[0]["response"], first)
+        finally:
+            engine.close()
+
+    def test_legacy_waiting_state_without_deadline_at(self) -> None:
+        legacy = sqlite3.connect(self.path)
+        legacy.execute("CREATE TABLE instances (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, state TEXT NOT NULL)")
+        state = initial_state(_await_workflow(), {})
+        assert state["waitingFor"] == "approved"
+        del state["deadlineAt"]
+        legacy.execute("INSERT INTO instances VALUES (?, ?, ?)",
+                       ("legacy-id", "approval", json.dumps(state)))
+        legacy.commit()
+        legacy.close()
+
+        engine = Engine(self.path)
+        try:
+            engine.define("approval", _await_workflow())
+            current = engine.get("legacy-id")["state"]
+            self.assertEqual(current["waitingFor"], "approved")
+            self.assertIsNone(current["deadlineAt"])
+            # No deadline recorded: timed_out is refused, the signal path still works.
+            with self.assertRaises(InvalidTransition):
+                engine.advance("legacy-id", "timed_out", event_id="t-1")
+            result = engine.signal("legacy-id", "approved", event_id="s-1")
+            self.assertEqual(result["state"]["completed"], ["ask"])
+            self.assertIsNone(result["state"]["deadlineAt"])
+        finally:
+            engine.close()
+
+
+class TimeoutHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from saga import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def call(self, method: str, path: str, body: dict | None = None):
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def test_put_rejects_bad_timeout_ms(self) -> None:
+        status, _ = self.call("PUT", "/v1/workflows/tw",
+                              {"steps": [{"name": "a", "await": {"event": "go", "timeoutMs": 100}}]})
+        self.assertEqual(status, 200)
+        for bad in ({"event": "go", "timeoutMs": True}, {"event": "go", "timeoutMs": 1.5},
+                    {"event": "go", "timeoutMs": 0}, {"event": "go", "timeoutMs": 86_400_001},
+                    {"event": "go", "timeoutMs": "100"}, {"timeoutMs": 100},
+                    {"event": "go", "timeoutMs": 100, "x": 1}):
+            status, body = self.call("PUT", "/v1/workflows/tw", {"steps": [{"name": "a", "await": bad}]})
+            self.assertEqual(status, 400, bad)
+            self.assertEqual(body["error"]["code"], "invalid_request")
+        status, body = self.call("PUT", "/v1/workflows/tw",
+                                 {"steps": [{"name": "a", "await": {"event": "go", "timeoutMs": 100}}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["steps"][0]["await"], {"event": "go", "timeoutMs": 100})
+
+    def test_timed_out_end_to_end(self) -> None:
+        self.call("PUT", "/v1/workflows/tflow", {"steps": [
+            {"name": "s1", "compensation": "c1", "await": {"event": "go", "timeoutMs": 1}},
+            {"name": "s2", "compensation": "c2"},
+        ]})
+        status, body = self.call("POST", "/v1/workflows/tflow/instances", {})
+        self.assertEqual(status, 201)
+        iid = body["id"]
+        self.assertEqual(body["state"]["waitingFor"], "go")
+        self.assertIsInstance(body["state"]["deadlineAt"], int)
+        time.sleep(0.02)
+        # succeeded/failed are still blocked while waiting; timed_out is accepted.
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/events",
+                                   {"outcome": "succeeded"})[0], 409)
+        status, first = self.call("POST", f"/v1/instances/{iid}/events",
+                                  {"outcome": "timed_out", "detail": {"why": "late"}, "eventId": "t-1"})
+        self.assertEqual(status, 200)
+        state = first["state"]
+        self.assertEqual(state["status"], "dead_lettered")
+        self.assertEqual((state["step"], state["index"]), ("s1", 0))
+        self.assertEqual(state["completed"], [])
+        self.assertEqual(state["compensated"], [])
+        self.assertEqual(state["failure"],
+                         {"step": "s1", "reason": "timeout", "detail": {"why": "late"}})
+        self.assertIsNone(state["waitingFor"])
+        self.assertIsNone(state["deadlineAt"])
+        # Idempotent replay and conflict.
+        status, replay = self.call("POST", f"/v1/instances/{iid}/events",
+                                   {"outcome": "timed_out", "detail": {"why": "late"}, "eventId": "t-1"})
+        self.assertEqual((status, replay), (200, first))
+        status, body = self.call("POST", f"/v1/instances/{iid}/events",
+                                 {"outcome": "timed_out", "detail": {"why": "x"}, "eventId": "t-1"})
+        self.assertEqual((status, body["error"]["code"]), (409, "invalid_transition"))
+        # Terminal for everything else.
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/events",
+                                   {"outcome": "succeeded"})[0], 409)
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/signals", {"event": "go"})[0], 409)
+        # Audit recorded exactly the accepted timed_out call.
+        status, audit = self.call("GET", f"/v1/instances/{iid}/audit")
+        self.assertEqual(status, 200)
+        self.assertEqual([h["seq"] for h in audit["history"]], [1])
+        self.assertEqual(audit["history"][0]["kind"], "event")
+        self.assertEqual(audit["history"][0]["request"],
+                         {"eventId": "t-1", "outcome": "timed_out", "detail": {"why": "late"}})
+        self.assertEqual(audit["history"][0]["response"], first)
+
+    def test_timed_out_rejection_statuses(self) -> None:
+        self.call("PUT", "/v1/workflows/tlong", {"steps": [
+            {"name": "s1", "await": {"event": "go", "timeoutMs": 86_400_000}},
+            {"name": "s2", "await": {"event": "later"}},
+        ]})
+        iid = self.call("POST", "/v1/workflows/tlong/instances", {})[1]["id"]
+        # Deadline not reached yet.
+        status, body = self.call("POST", f"/v1/instances/{iid}/events", {"outcome": "timed_out"})
+        self.assertEqual((status, body["error"]["code"]), (409, "invalid_transition"))
+        # Signal before the deadline takes the success path and clears the deadline.
+        status, body = self.call("POST", f"/v1/instances/{iid}/signals", {"event": "go"})
+        self.assertEqual(status, 200)
+        self.assertIsNone(body["state"]["deadlineAt"])
+        # The next wait has no timeoutMs: timed_out is refused there too.
+        self.assertEqual(body["state"]["waitingFor"], "later")
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/events",
+                                   {"outcome": "timed_out"})[0], 409)
+        # Unknown instance and illegal outcome.
+        self.assertEqual(self.call("POST", "/v1/instances/missing/events",
+                                   {"outcome": "timed_out"})[0], 404)
+        status, body = self.call("POST", f"/v1/instances/{iid}/events", {"outcome": "bogus"})
+        self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
 
 
 if __name__ == "__main__":

@@ -16,15 +16,19 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 
 - **工作流定义**：`{"steps":[{"name":"reserve-stock","compensation":"release-stock"}, ...]}`（1–20 步）。
   每步可带可选 `retry` 对象，只允许 `{"maxAttempts": <整数 2..10>}`。
-  每步可带可选 `await` 对象，只允许 `{"event": "<事件名>"}`，事件名为 ≤100 字符的非空字符串；
-  含未知字段、缺 `event`、空值或非法类型 ⇒ `400 invalid_request`，已有同名定义保持不变。
-- **实例状态**：`{"status":"running|completed|compensated", "step": <当前步骤名或 null>, "index": <int>,
+  每步可带可选 `await` 对象，只允许 `{"event": "<事件名>", "timeoutMs": <可选整数 1..86400000>}`，
+  事件名为 ≤100 字符的非空字符串；`timeoutMs` 为等待超时毫秒数（布尔、小数、非整数、越界均非法）。
+  含未知字段、缺 `event`、空值或非法类型 ⇒ `400 invalid_request`，已有同名定义保持不变；
+  不带 `timeoutMs` 的 `await` 保持原有语义（无限期等待）。
+- **实例状态**：`{"status":"running|completed|compensated|dead_lettered", "step": <当前步骤名或 null>, "index": <int>,
   "attempt": <当前步骤的尝试序号，从 1 开始，进入新步骤时重置为 1>,
   "completed":[<已完成步骤名>], "compensated":[<将/已执行的补偿名，逆序>], "context": {...}, "failure": null|{...},
-  "waitingFor": <当前步骤等待的事件名或 null>}`。
+  "waitingFor": <当前步骤等待的事件名或 null>, "deadlineAt": <等待截止时刻，Unix epoch 毫秒整数或 null>}`。
   到达带 `await` 的步骤时实例仍为 `running`，`step`/`index`/`attempt` 不变，`waitingFor` 为事件名；
-  无等待时 `waitingFor` 为 `null`（终态亦为 `null`）。
-- 状态转移是**纯函数**：同样的 `(状态, outcome)` 永远得到同样的下一个状态。
+  该 `await` 带 `timeoutMs` 时 `deadlineAt` 为进入等待时刻 + `timeoutMs`，否则为 `null`；
+  无等待时 `waitingFor` 与 `deadlineAt` 均为 `null`（终态亦为 `null`）。
+  旧状态缺少 `waitingFor`/`deadlineAt` 字段时按 `null` 读取。
+- 状态转移是**纯函数**：同样的 `(状态, outcome, 当前时刻)` 永远得到同样的下一个状态。
 
 ## 接口
 
@@ -44,7 +48,7 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 请求体：`{"context": {...}}`（可省）→ **`201`** `{"id": <uuid>, "workflow": name, "state": {...}}`。
 
 ### `POST /v1/instances/{id}/events`
-请求体：`{"outcome": "succeeded"|"failed", "detail": <任意 JSON>, "eventId": "<可选>"}` →
+请求体：`{"outcome": "succeeded"|"failed"|"timed_out", "detail": <任意 JSON>, "eventId": "<可选>"}` →
 `200 {"id":..., "workflow":..., "state": {...}}`。
 - `succeeded`：推进到下一步（`attempt` 重置为 1，`failure` 清除）；已是最后一步 ⇒ `status="completed"`。
 - `failed`：
@@ -52,8 +56,17 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
     `attempt` 加一，`failure` 记录本步 `step` 与 `detail`，`completed`/`compensated` 不变。
   - 否则（无 `retry`，或 `attempt` 已等于 `maxAttempts`）：`status="compensated"`，
     `compensated` = 本步及之前所有**带补偿**的步骤名**逆序**。
-- 实例已终态（completed/compensated）再发事件 ⇒ **`409 invalid_transition`**；`outcome` 非法 ⇒ `400`。
-- 当前步骤带 `await`（`waitingFor` 非空）时，`/events` 一律 ⇒ **`409 invalid_transition`**；
+- `timed_out`：等待超时死信。仅当实例 `running`、当前步骤正在等待（`waitingFor` 非空）、
+  `deadlineAt` 非空且已到期（当前时刻 ≥ `deadlineAt`）才接受：
+  - `status="dead_lettered"`（终态），`step`/`index` 保留超时位置，`completed`/`compensated` 不变；
+  - `failure = {"step": <超时步骤名>, "reason": "timeout", "detail": <请求 detail>}`；
+  - `waitingFor` 与 `deadlineAt` 清为 `null`。
+  未到期限、当前步骤非等待、等待无 `timeoutMs`（`deadlineAt` 为 `null`）、实例已终态
+  ⇒ **`409 invalid_transition`**；实例不存在 ⇒ `404 not_found`。
+  期限之前到达的匹配信号仍按原成功路径推进并清除 `deadlineAt`（见 `/signals`）。
+- 实例已终态（completed/compensated/dead_lettered）再发事件 ⇒ **`409 invalid_transition`**；
+  `outcome` 非法 ⇒ `400 invalid_request`。
+- 当前步骤带 `await`（`waitingFor` 非空）时，`succeeded`/`failed` 一律 ⇒ **`409 invalid_transition`**；
   收到匹配信号、步骤推进之后，才能继续对新的当前步骤提交 `succeeded`/`failed`。
 
 ### `POST /v1/instances/{id}/signals`
@@ -61,7 +74,9 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 `200 {"id":..., "workflow":..., "state": {...}}`。
 - 仅当实例 `running` 且当前步骤 `waitingFor` 与 `event` 相同才接受：当前步骤按**成功结果**完成
   （`completed` 加入步骤名，`failure` 清除，`attempt` 重置为 1）并进入下一步；下一步仍带 `await`
-  则 `waitingFor` 更新为新事件名；若已是最后一步则 `status="completed"`，`step` 与 `waitingFor` 均为 `null`。
+  则 `waitingFor` 更新为新事件名（带 `timeoutMs` 时同时设置新的 `deadlineAt`）；若已是最后一步则
+  `status="completed"`，`step`、`waitingFor` 与 `deadlineAt` 均为 `null`。
+  期限之前到达的匹配信号始终走此成功路径，不受 `timeoutMs` 影响。
 - 实例不存在 ⇒ `404 not_found`；实例终态、当前步骤无 `await`（`waitingFor` 为 `null`）或事件名不匹配
   ⇒ **`409 invalid_transition`**；请求体不是对象、含未知字段、缺 `event` 或 `event` 为非法类型
   ⇒ **`400 invalid_request`**（`event` 与 `eventId` 同样必须是 ≤100 字符的非空字符串）。
@@ -85,14 +100,18 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 - 相同 `(实例, eventId)` 再次提交：
   - `outcome` 相同且 `detail` 的 JSON 值相同 ⇒ 返回**首次处理的 200 响应原文**（含当时的
     `state`），不改变当前状态，不重复累计 `completed`/`compensated`/`failure`（终态后回放仍返回 200）。
-  - `outcome` 或 `detail` 不同 ⇒ **`409 invalid_transition`**，状态不变。
-- 非法 `outcome`、终态推进、不存在实例的请求**不写账本**。
+  - `outcome` 或 `detail` 不同 ⇒ **`409 invalid_transition`**，状态不变，不写账本。
+- `timed_out` 与 `succeeded`/`failed` 共用同一事件账本与同一套幂等规则：相同载荷回放首次
+  响应原文（含 `dead_lettered` 状态与 `failure`），不同 `outcome` 或 `detail` ⇒ `409`。
+- 非法 `outcome`、终态推进、未到期限/非等待/无超时的 `timed_out`、不存在实例的请求**不写账本**。
 - 并发提交同一实例的事件等价于某个确定的串行顺序；同一 `eventId` 并发时一个请求完成首次处理，
   其余请求得到首次响应。
 - 新表均以 `CREATE TABLE IF NOT EXISTS` 建立，旧 SQLite 文件直接可读；旧实例带上 `eventId`
   后照常读取与推进。不含 `attempt` 字段的旧实例状态直接可读，首次推进时按 `attempt=1` 补齐；
-  不含 `waitingFor` 字段的旧实例按 `null` 读取（即不处于等待状态），可继续接受原有 `/events`。
-  等待状态随实例状态持久化、信号幂等记录随 `instance_signals` 持久化，重开服务后等待与回放结果一致。
+  不含 `waitingFor` 字段的旧实例按 `null` 读取（即不处于等待状态），可继续接受原有 `/events`；
+  不含 `deadlineAt` 字段的旧实例同样按 `null` 读取（等待无超时，`timed_out` 对其返回 `409`）。
+  等待状态（含 `deadlineAt`）随实例状态持久化、信号幂等记录随 `instance_signals` 持久化，
+  重开服务后等待、死信状态、`failure` 与回放结果一致。
 
 ### `GET /v1/instances/{id}`
 `200 {"id","workflow","state"}`；未知 id ⇒ `404 not_found`。
@@ -104,7 +123,8 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 - 每条记录：`{"seq","kind","eventId","request","response"}`；`kind` 为 `event`（/events）或
   `signal`（/signals），同一 `eventId` 字符串被事件与信号复用时通过 `kind` 区分。
 - `request` 保存归一化输入（`eventId`/`outcome`/`detail` 或 `eventId`/`event`/`detail`）；
-  未提交 `eventId` 时记录中的 `eventId` 为 `null`；省略 `detail` 与显式 `null` 都记为 `null`。
+  未提交 `eventId` 时记录中的 `eventId` 为 `null`；省略 `detail` 与显式 `null` 都记为 `null`；
+  被接受的 `timed_out` 以 `kind="event"`、`request.outcome="timed_out"` 记录，`seq` 连续递增。
 - `response` 保存该次处理返回的完整 JSON 响应，无需重新执行状态机即可逐条核对当时结果。
 - 幂等回放（相同 `eventId` 相同载荷）仍只返回首次响应且只占一条审计记录，即使实例后来已终态；
   非法请求、相同 `eventId` 不同载荷、终态推进、等待期间提交事件、信号名不匹配等被拒绝的调用
@@ -122,5 +142,5 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 
 ## 未实现（后续任务候选，非固定题单）
 
-超时与死信、并发与抢占、编排版本迁移与在飞实例、分区与顺序保证、
+并发与抢占、编排版本迁移与在飞实例、分区与顺序保证、
 持久化恢复与重放、限流与背压、可视化查询与审计回放、失败注入测试。
