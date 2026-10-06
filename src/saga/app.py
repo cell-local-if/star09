@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -46,6 +47,14 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
 # Sentinel: distinguishes "eventId not carried" (baseline behavior) from an explicit null.
 _UNSET = object()
 
+# Longest a step may wait for its event: 24 hours in milliseconds.
+MAX_TIMEOUT_MS = 86_400_000
+
+
+def _now_ms() -> int:
+    """Wall clock as Unix epoch milliseconds; the single time source for deadlines."""
+    return int(time.time() * 1000)
+
 
 def validate_workflow(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
@@ -76,9 +85,10 @@ def validate_workflow(payload: Any) -> dict[str, Any]:
 
 
 def _validate_await(await_cfg: Any, index: int) -> dict[str, Any]:
-    """A step's await config is exactly {"event": <non-empty string <=100>}."""
-    if not isinstance(await_cfg, dict) or set(await_cfg) - {"event"}:
-        raise InvalidRequest(f"steps[{index}].await must be an object with only event")
+    """A step's await config is {"event": <non-empty string <=100>} plus an optional
+    ``timeoutMs`` (integer 1..86400000); anything else is 400."""
+    if not isinstance(await_cfg, dict) or set(await_cfg) - {"event", "timeoutMs"}:
+        raise InvalidRequest(f"steps[{index}].await must be an object with only event/timeoutMs")
     if "event" not in await_cfg:
         raise InvalidRequest(f"steps[{index}].await.event is required")
     event = await_cfg["event"]
@@ -86,7 +96,17 @@ def _validate_await(await_cfg: Any, index: int) -> dict[str, Any]:
         raise InvalidRequest(
             f"steps[{index}].await.event must be a non-empty string of at most 100 characters"
         )
-    return {"event": event}
+    cleaned: dict[str, Any] = {"event": event}
+    if "timeoutMs" in await_cfg:
+        timeout = await_cfg["timeoutMs"]
+        if isinstance(timeout, bool) or not isinstance(timeout, int):
+            raise InvalidRequest(f"steps[{index}].await.timeoutMs must be an integer")
+        if not 1 <= timeout <= MAX_TIMEOUT_MS:
+            raise InvalidRequest(
+                f"steps[{index}].await.timeoutMs must be between 1 and {MAX_TIMEOUT_MS}"
+            )
+        cleaned["timeoutMs"] = timeout
+    return cleaned
 
 
 def _validate_retry(retry: Any, index: int) -> dict[str, Any]:
@@ -108,23 +128,47 @@ def _await_event(step: dict[str, Any]) -> str | None:
     return await_cfg["event"] if await_cfg else None
 
 
-def initial_state(workflow: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+def _wait_fields(step: dict[str, Any], now_ms: int | None) -> tuple[str | None, int | None]:
+    """The (waitingFor, deadlineAt) pair for a step being entered.
+
+    A step without await waits for nothing; an await without timeoutMs waits
+    forever (deadlineAt null); an await with timeoutMs sets deadlineAt to
+    now + timeoutMs, so the same (entry time, definition) always yields the
+    same deadline.
+    """
+    await_cfg = step.get("await")
+    if not await_cfg:
+        return None, None
+    timeout = await_cfg.get("timeoutMs")
+    if timeout is None:
+        return await_cfg["event"], None
+    if now_ms is None:
+        now_ms = _now_ms()
+    return await_cfg["event"], now_ms + timeout
+
+
+def initial_state(workflow: dict[str, Any], context: dict[str, Any],
+                  now_ms: int | None = None) -> dict[str, Any]:
     first = workflow["steps"][0]
+    waiting_for, deadline_at = _wait_fields(first, now_ms)
     return {"status": "running", "step": first["name"], "index": 0, "attempt": 1,
             "completed": [], "compensated": [], "context": dict(context), "failure": None,
-            "waitingFor": _await_event(first)}
+            "waitingFor": waiting_for, "deadlineAt": deadline_at}
 
 
-def apply_outcome(workflow: dict[str, Any], state: dict[str, Any], outcome: str, detail: Any = None) -> dict[str, Any]:
-    """Pure transition: the same (state, outcome) always yields the same next state."""
+def apply_outcome(workflow: dict[str, Any], state: dict[str, Any], outcome: str, detail: Any = None,
+                  now_ms: int | None = None) -> dict[str, Any]:
+    """Pure transition: the same (state, outcome, now) always yields the same next state."""
     if state["status"] != "running":
         raise InvalidTransition(f"instance is {state['status']}, not running")
+    if outcome == "timed_out":
+        return _apply_timed_out(workflow, state, detail, now_ms)
     if state.get("waitingFor") is not None:
         raise InvalidTransition(f"instance is waiting for signal {state['waitingFor']!r}")
     if outcome not in {"succeeded", "failed"}:
-        raise InvalidRequest("outcome must be 'succeeded' or 'failed'")
+        raise InvalidRequest("outcome must be 'succeeded', 'failed' or 'timed_out'")
     if outcome == "succeeded":
-        return _apply_succeeded(workflow, state)
+        return _apply_succeeded(workflow, state, now_ms)
     steps = workflow["steps"]
     index = int(state["index"])
     # Instances persisted before the attempt field existed are treated as attempt=1.
@@ -136,9 +180,10 @@ def apply_outcome(workflow: dict[str, Any], state: dict[str, Any], outcome: str,
     max_attempts = retry.get("maxAttempts")
     if max_attempts is not None and attempt < max_attempts:
         # Retryable failure: stay on the same step, bump the attempt counter,
-        # keep completed/compensated untouched.
+        # keep completed/compensated untouched. Re-entering the step restarts
+        # any wait, so the deadline (if any) is recomputed from now.
         next_state["attempt"] = attempt + 1
-        next_state["waitingFor"] = _await_event(steps[index])
+        next_state["waitingFor"], next_state["deadlineAt"] = _wait_fields(steps[index], now_ms)
         return next_state
     pending = [s["compensation"] for s in steps[: index + 1] if s.get("compensation")]
     next_state["compensated"] = list(reversed(pending))
@@ -146,10 +191,41 @@ def apply_outcome(workflow: dict[str, Any], state: dict[str, Any], outcome: str,
     next_state["status"] = "compensated"
     next_state["step"] = None
     next_state["waitingFor"] = None
+    next_state["deadlineAt"] = None
     return next_state
 
 
-def _apply_succeeded(workflow: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+def _apply_timed_out(workflow: dict[str, Any], state: dict[str, Any], detail: Any,
+                     now_ms: int | None) -> dict[str, Any]:
+    """Dead-letter a waiting step whose deadline has passed.
+
+    Accepted only while running, on a step that is waiting, with a non-null
+    deadlineAt that has been reached. The instance keeps its position (step,
+    index, completed, compensated untouched) and becomes terminally
+    dead_lettered; the failure records the step, reason "timeout" and detail.
+    """
+    waiting_for = state.get("waitingFor")
+    if waiting_for is None:
+        raise InvalidTransition("current step is not waiting for an event")
+    deadline = state.get("deadlineAt")
+    if deadline is None:
+        raise InvalidTransition(f"wait for signal {waiting_for!r} has no timeout")
+    if now_ms is None:
+        now_ms = _now_ms()
+    if now_ms < deadline:
+        raise InvalidTransition(f"wait for signal {waiting_for!r} has not reached its deadline")
+    steps = workflow["steps"]
+    index = int(state["index"])
+    next_state = json.loads(json.dumps(state))
+    next_state["status"] = "dead_lettered"
+    next_state["failure"] = {"step": steps[index]["name"], "reason": "timeout", "detail": detail}
+    next_state["waitingFor"] = None
+    next_state["deadlineAt"] = None
+    return next_state
+
+
+def _apply_succeeded(workflow: dict[str, Any], state: dict[str, Any],
+                     now_ms: int | None = None) -> dict[str, Any]:
     """Complete the current step and advance (shared by succeeded outcomes and signals)."""
     steps = workflow["steps"]
     index = int(state["index"])
@@ -162,20 +238,23 @@ def _apply_succeeded(workflow: dict[str, Any], state: dict[str, Any]) -> dict[st
         next_state["step"] = None
         next_state["index"] = index
         next_state["waitingFor"] = None
+        next_state["deadlineAt"] = None
         return next_state
     next_state["index"] = index + 1
     next_state["step"] = steps[index + 1]["name"]
-    next_state["waitingFor"] = _await_event(steps[index + 1])
+    next_state["waitingFor"], next_state["deadlineAt"] = _wait_fields(steps[index + 1], now_ms)
     return next_state
 
 
-def apply_signal(workflow: dict[str, Any], state: dict[str, Any], event: str, detail: Any = None) -> dict[str, Any]:
+def apply_signal(workflow: dict[str, Any], state: dict[str, Any], event: str, detail: Any = None,
+                 now_ms: int | None = None) -> dict[str, Any]:
     """Pure transition for an external signal.
 
     Only a running instance whose current step awaits *event* accepts it; the signal
     completes the current step exactly like a succeeded outcome and moves to the next
     step, which may itself await another event. Detail participates only in request
-    identity (ledger replay), like event detail.
+    identity (ledger replay), like event detail. A signal that arrives before the
+    wait's deadline takes this same success path and clears the deadline.
     """
     if state["status"] != "running":
         raise InvalidTransition(f"instance is {state['status']}, not running")
@@ -184,7 +263,7 @@ def apply_signal(workflow: dict[str, Any], state: dict[str, Any], event: str, de
         raise InvalidTransition("current step is not waiting for an event")
     if event != waiting_for:
         raise InvalidTransition(f"instance is waiting for {waiting_for!r}, not {event!r}")
-    return _apply_succeeded(workflow, state)
+    return _apply_succeeded(workflow, state, now_ms)
 
 
 def _read_state(raw: str) -> dict[str, Any]:
@@ -192,6 +271,8 @@ def _read_state(raw: str) -> dict[str, Any]:
     state = json.loads(raw)
     # Instances persisted before external-event waits existed simply are not waiting.
     state.setdefault("waitingFor", None)
+    # Instances persisted before wait timeouts existed have no deadline.
+    state.setdefault("deadlineAt", None)
     return state
 
 
@@ -253,18 +334,19 @@ class Engine:
                 raise InvalidRequest(f"unknown workflow {name!r}")
             return self._workflows[name]
 
-    def start(self, name: str, context: Any = None) -> dict[str, Any]:
+    def start(self, name: str, context: Any = None, now_ms: int | None = None) -> dict[str, Any]:
         if context is not None and not isinstance(context, dict):
             raise InvalidRequest("context must be a JSON object when present")
         workflow = self.workflow(name)
         instance_id = str(uuid.uuid4())
-        state = initial_state(workflow, context or {})
+        state = initial_state(workflow, context or {}, now_ms)
         with self._lock:
             self._db.execute("INSERT INTO instances VALUES (?, ?, ?)", (instance_id, name, json.dumps(state)))
             self._db.commit()
         return {"id": instance_id, "workflow": name, "state": state}
 
-    def advance(self, instance_id: str, outcome: Any, detail: Any = None, event_id: Any = _UNSET) -> dict[str, Any]:
+    def advance(self, instance_id: str, outcome: Any, detail: Any = None, event_id: Any = _UNSET,
+                now_ms: int | None = None) -> dict[str, Any]:
         """Apply one outcome event atomically.
 
         Without event_id the behavior is the baseline: every call re-enters the state
@@ -273,7 +355,9 @@ class Engine:
         request returns the first response verbatim (including its historical state)
         without touching the instance state; a repeat whose outcome/detail differs
         raises InvalidTransition. Nothing is written to the ledger unless the transition
-        succeeds.
+        succeeds. The ``timed_out`` outcome shares all of this; it is accepted only
+        for a waiting step whose deadline has passed and ends the instance as
+        dead_lettered.
         """
         if event_id is _UNSET:
             # Anonymous call: no ledger, but the audit trail still records the
@@ -284,9 +368,10 @@ class Engine:
             normalized = self._normalize_request(event_id, {"outcome": outcome, "detail": detail},
                                                  ("eventId", "outcome", "detail"))
         return self._commit(instance_id, "instance_events", "event", normalized,
-                            lambda workflow, state: apply_outcome(workflow, state, outcome, detail))
+                            lambda workflow, state: apply_outcome(workflow, state, outcome, detail, now_ms))
 
-    def signal(self, instance_id: str, event: Any, detail: Any = None, event_id: Any = _UNSET) -> dict[str, Any]:
+    def signal(self, instance_id: str, event: Any, detail: Any = None, event_id: Any = _UNSET,
+               now_ms: int | None = None) -> dict[str, Any]:
         """Deliver an external signal to a waiting instance, with eventId semantics
         identical to :meth:`advance` (instance-scoped, full-response replay).
 
@@ -302,7 +387,7 @@ class Engine:
             normalized = self._normalize_request(event_id, {"event": event, "detail": detail},
                                                  ("eventId", "event", "detail"))
         return self._commit(instance_id, "instance_signals", "signal", normalized,
-                            lambda workflow, state: apply_signal(workflow, state, event, detail))
+                            lambda workflow, state: apply_signal(workflow, state, event, detail, now_ms))
 
     def _commit(self, instance_id: str, table: str, kind: str, normalized: dict[str, Any],
                 transition: Any) -> dict[str, Any]:
@@ -486,7 +571,7 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                     body = self._read_json()
                     if not isinstance(body, dict) or set(body) - {"outcome", "detail", "eventId"}:
                         raise InvalidRequest(
-                            'body must be {"outcome": "succeeded|failed", "detail": ..., "eventId": "..."}'
+                            'body must be {"outcome": "succeeded|failed|timed_out", "detail": ..., "eventId": "..."}'
                         )
                     event_id = body["eventId"] if "eventId" in body else _UNSET
                     return self._send(
