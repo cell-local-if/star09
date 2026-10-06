@@ -33,6 +33,12 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
   该 `await` 带 `timeoutMs` 时 `deadlineAt` 为进入等待时刻 + `timeoutMs`，否则为 `null`；
   无等待时 `waitingFor` 与 `deadlineAt` 均为 `null`（终态亦为 `null`）。
   旧状态缺少 `waitingFor`/`deadlineAt` 字段时按 `null` 读取。
+- **实例版本（并发控制）**：每个实例携带一个从 1 开始的整数版本，作为其 `ETag`。
+  只有真正改变实例的调用才使其加 1：被接受的事件或信号推进状态机后加 1，成功迁移也加 1
+  （迁移的 `state` 仍逐字段保留迁移前内容）。非法事件、终态继续推进、等待期间提交普通结果、
+  信号名不匹配、未到期的 `timed_out`、不兼容迁移、幂等回放等都不改变版本。
+  版本随实例行持久化（`instances.instance_version` 列，旧文件自动 `ALTER TABLE` 补齐、
+  旧实例为 `NULL`）；`NULL` 按版本 1 读取，下一次真正变更后变为 2，不伪造历史变更次数。
 - 状态转移是**纯函数**：同样的 `(状态, outcome, 当前时刻)` 永远得到同样的下一个状态。
 
 ## 接口
@@ -56,7 +62,8 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 
 ### `POST /v1/workflows/{name}/instances`
 请求体：`{"context": {...}, "version": <可选正整数>}`（均可省）→ **`201`**
-`{"id": <uuid>, "workflow": name, "workflowVersion": <固定的版本号>, "state": {...}}`。
+`{"id": <uuid>, "workflow": name, "workflowVersion": <固定的版本号>, "state": {...}}`，
+响应带 `ETag: "1"`（新实例的版本恒为 1）。
 省略 `version` 启动当时最新版；指定正整数则固定到该现存版本。
 `version` 非正整数（含布尔、小数、字符串、0、负数）⇒ `400 invalid_request`；
 版本不存在 ⇒ `404 not_found`；未知工作流（未指定版本）⇒ `400 invalid_request`。
@@ -64,6 +71,8 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 ### `POST /v1/instances/{id}/events`
 请求体：`{"outcome": "succeeded"|"failed"|"timed_out", "detail": <任意 JSON>, "eventId": "<可选>"}` →
 `200 {"id":..., "workflow":..., "workflowVersion":..., "state": {...}}`。
+接受可选 `If-Match` 并发前置条件（见「并发控制」）；成功的 200 与幂等回放响应都带
+`ETag`，值为**当前**实例版本。
 - `succeeded`：推进到下一步（`attempt` 重置为 1，`failure` 清除）；已是最后一步 ⇒ `status="completed"`。
 - `failed`：
   - 当前步骤配置了 `retry` 且 `attempt < maxAttempts`：实例保持 `running`，`step`/`index` 不变，
@@ -86,6 +95,8 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 ### `POST /v1/instances/{id}/signals`
 请求体：`{"event": "<事件名>", "detail": <任意 JSON>, "eventId": "<可选>"}` →
 `200 {"id":..., "workflow":..., "workflowVersion":..., "state": {...}}`。
+接受可选 `If-Match` 并发前置条件（见「并发控制」）；成功的 200 与幂等回放响应都带
+`ETag`，值为**当前**实例版本。
 - 仅当实例 `running` 且当前步骤 `waitingFor` 与 `event` 相同才接受：当前步骤按**成功结果**完成
   （`completed` 加入步骤名，`failure` 清除，`attempt` 重置为 1）并进入下一步；下一步仍带 `await`
   则 `waitingFor` 更新为新事件名（带 `timeoutMs` 时同时设置新的 `deadlineAt`）；若已是最后一步则
@@ -131,12 +142,14 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
   仍能拿到启动时的定义，版本归属与回放响应（含其中的 `workflowVersion`）保持不变。
 
 ### `GET /v1/instances/{id}`
-`200 {"id","workflow","workflowVersion","state"}`；未知 id ⇒ `404 not_found`。
+`200 {"id","workflow","workflowVersion","state"}`，响应带 `ETag`，值为带双引号的当前实例版本
+（如 `"1"`）；未知 id ⇒ `404 not_found`。
 `workflowVersion` 为实例固定的定义版本；版本化之前持久化的旧实例（SQLite 中无版本字段）返回
 `null`，并在首次成功推进时补记当时最新版（之后照常固定）。
 
 ### `POST /v1/instances/{id}/migrate`
 请求体：`{"version": <正整数>}` → `200 {"id","workflow","workflowVersion","state"}`。
+接受可选 `If-Match` 并发前置条件（见「并发控制」）；成功响应带 `ETag`，值为迁移后的当前实例版本。
 把 **running** 实例重新固定到同名工作流的另一个**现存版本**：
 - 目标版本的步骤总数与有序步骤名必须与当前版本一致；
 - 当前 `index` 对应步骤及之前所有步骤的定义（`name`/`compensation`/`retry`/`await`）必须完全一致，
@@ -149,7 +162,8 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
   ⇒ `409 invalid_transition`，且状态、账本、审计均不变。
 
 ### `GET /v1/instances/{id}/audit`
-实例级只读审计查询（无请求体）→ `200 {"id","workflow","workflowVersion","state","history":[...]}`；未知 id ⇒ `404 not_found`。
+实例级只读审计查询（无请求体）→ `200 {"id","workflow","workflowVersion","state","history":[...]}`，
+响应带 `ETag`，值为带双引号的当前实例版本；未知 id ⇒ `404 not_found`。
 - `state` 为查询时的当前状态（与 `GET /v1/instances/{id}` 一致）；`history` 按 `seq` 从 1 开始严格递增，
   只收录**真正推进状态机**的 `/events` 与 `/signals` 调用。
 - 每条记录：`{"seq","kind","eventId","request","response"}`；`kind` 为 `event`（/events）或
@@ -166,6 +180,31 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 - 新表以 `CREATE TABLE IF NOT EXISTS` 建立，旧 SQLite 文件直接可读且既有读取与回放行为不变；
   升级前的调用**不伪造补录**，旧实例从升级后的下一次成功推进开始积累历史。
 
+## 并发控制（实例版本与 If-Match）
+
+实例级乐观并发：客户端用 `ETag`/`If-Match` 避免以旧观察结果覆盖已接受的推进或迁移。
+本特性只增加实例级版本抢占语义，不改变工作流定义、状态转移、补偿顺序、幂等规则、
+迁移兼容规则与既有审计；**省略 `If-Match` 的请求完全遵守既有公开契约**，成功响应、
+状态字段、JSON 字段与错误码不变。
+
+- **ETag**：`GET /v1/instances/{id}`、`GET /v1/instances/{id}/audit`、启动成功的 `201`
+  以及 `/events`、`/signals`、`/migrate` 的成功与回放响应都带 `ETag` 响应头，
+  值为带双引号的十进制实例版本（如 `"1"`），始终反映**当前**实例版本
+  （回放响应体仍是首次处理的原文，但 `ETag` 为当前版本）。
+- **If-Match**：`POST /v1/instances/{id}/events`、`/signals`、`/migrate` 接受可选
+  `If-Match` 请求头，值只能是带双引号的十进制版本（如 `"2"`）：
+  - 与当前实例版本相等 ⇒ 照常处理；不相等 ⇒ **`409 invalid_transition`**，
+    状态、版本、幂等账本、审计均不变。
+  - 值为空、含多个值（含多个 `If-Match` 头行）、弱标记（`W/"1"`）、`*`、无引号数字
+    或其他格式 ⇒ **`400 invalid_request`**，同样不产生任何写入。
+  - 未知实例仍 ⇒ `404 not_found`。
+- **与幂等回放的关系**：相同 `eventId` 且载荷相同的回放**先于** `If-Match` 判断——
+  即使调用方携带的版本已过期，也返回首次完整响应，且不改变版本、状态、账本或审计；
+  相同 `eventId` 携带不同载荷仍 ⇒ `409 invalid_transition`。
+- **版本递增**：实例版本只在真正改变实例时加 1（被接受的事件/信号推进、成功迁移），
+  与状态更新、账本、审计在同一事务提交，随同一 SQLite 文件重开保持一致；
+  一切被拒绝的调用与幂等回放都不改变版本。
+
 ## 错误语义
 
 ```json
@@ -174,5 +213,5 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 
 ## 未实现（后续任务候选，非固定题单）
 
-并发与抢占、分区与顺序保证、
+分区与顺序保证、
 持久化恢复与重放、限流与背压、可视化查询与审计回放、失败注入测试。
