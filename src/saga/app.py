@@ -220,6 +220,19 @@ class Engine:
             "request TEXT NOT NULL, response TEXT NOT NULL, "
             "PRIMARY KEY (instance_id, event_id))"
         )
+        # Instance audit trail: one row per accepted (state-advancing) call, in the
+        # deterministic serial order the calls were committed. seq is per-instance and
+        # strictly increasing from 1; kind is "event" or "signal" so an eventId string
+        # reused across the two ledgers still yields distinct records. Written in the
+        # same transaction as the state update and the idempotency ledger. Old files
+        # simply start with an empty history; nothing is backfilled for calls that
+        # predate the upgrade.
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS instance_audit ("
+            "instance_id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL, "
+            "event_id TEXT, request TEXT NOT NULL, response TEXT NOT NULL, "
+            "PRIMARY KEY (instance_id, seq))"
+        )
         self._db.commit()
         self._workflows: dict[str, dict[str, Any]] = dict(WORKFLOWS)
 
@@ -268,7 +281,8 @@ class Engine:
             normalized = self._normalize_request(event_id, {"outcome": outcome, "detail": detail},
                                                  ("eventId", "outcome", "detail"))
             event_id = normalized["eventId"]
-        return self._commit(instance_id, "instance_events", event_id, normalized,
+        return self._commit(instance_id, "instance_events", "event", event_id, normalized,
+                            {"outcome": outcome, "detail": detail},
                             lambda workflow, state: apply_outcome(workflow, state, outcome, detail))
 
     def signal(self, instance_id: str, event: Any, detail: Any = None, event_id: Any = _UNSET) -> dict[str, Any]:
@@ -285,16 +299,22 @@ class Engine:
             normalized = self._normalize_request(event_id, {"event": event, "detail": detail},
                                                  ("eventId", "event", "detail"))
             event_id = normalized["eventId"]
-        return self._commit(instance_id, "instance_signals", event_id, normalized,
+        return self._commit(instance_id, "instance_signals", "signal", event_id, normalized,
+                            {"event": event, "detail": detail},
                             lambda workflow, state: apply_signal(workflow, state, event, detail))
 
-    def _commit(self, instance_id: str, table: str, event_id: Any, normalized: dict[str, Any] | None,
+    def _commit(self, instance_id: str, table: str, kind: str, event_id: Any,
+                normalized: dict[str, Any] | None, audit_request: dict[str, Any],
                 transition: Any) -> dict[str, Any]:
         """Shared idempotent commit for outcome events and signals.
 
-        Lookup, ledger replay, state transition and ledger insert happen under one
-        lock and in one transaction; the ledger primary key makes a racing duplicate
-        insert fail even if the lock were ever bypassed.
+        Lookup, ledger replay, state transition, ledger insert and audit append happen
+        under one lock and in one transaction; the ledger primary key makes a racing
+        duplicate insert fail even if the lock were ever bypassed. The audit row is
+        appended only when the transition actually advances the state machine — ledger
+        replays and every rejection leave no trace — and its seq is the next integer
+        after the instance's current maximum, so concurrent accepted calls land in one
+        deterministic serial order with contiguous seq values.
         """
         with self._lock:
             row = self._db.execute("SELECT workflow, state FROM instances WHERE id = ?", (instance_id,)).fetchone()
@@ -308,9 +328,9 @@ class Engine:
                 if ledger is not None:
                     stored_request, stored_response = ledger
                     if stored_request != json.dumps(normalized, separators=(",", ":"), sort_keys=True):
-                        kind = "signal" if table == "instance_signals" else "eventId"
+                        kind_label = "signal" if table == "instance_signals" else "eventId"
                         raise InvalidTransition(
-                            f"{kind} {event_id!r} was already submitted for this instance with a different payload"
+                            f"{kind_label} {event_id!r} was already submitted for this instance with a different payload"
                         )
                     return json.loads(stored_response)
             workflow = self.workflow(row[0])
@@ -325,6 +345,17 @@ class Engine:
                      json.dumps(normalized, separators=(",", ":"), sort_keys=True),
                      json.dumps(response)),
                 )
+            seq = self._db.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM instance_audit WHERE instance_id = ?",
+                (instance_id,),
+            ).fetchone()[0]
+            self._db.execute(
+                "INSERT INTO instance_audit (instance_id, seq, kind, event_id, request, response)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (instance_id, seq, kind, None if event_id is _UNSET else event_id,
+                 json.dumps(audit_request, separators=(",", ":"), sort_keys=True),
+                 json.dumps(response)),
+            )
             self._db.commit()
         return response
 
@@ -351,6 +382,31 @@ class Engine:
         if row is None:
             raise InstanceNotFound(f"no instance {instance_id}")
         return {"id": instance_id, "workflow": row[0], "state": _read_state(row[1])}
+
+    def audit(self, instance_id: str) -> dict[str, Any]:
+        """Read-only history of every accepted (state-advancing) event and signal.
+
+        Records come back in commit order: seq starts at 1 and increases strictly.
+        Each record carries the normalized request payload (detail normalized so an
+        omitted value and an explicit null both read as null) and the full JSON
+        response that processing returned, so past results can be checked without
+        re-running the state machine. Replays and rejected calls never appear here.
+        """
+        with self._lock:
+            row = self._db.execute("SELECT workflow, state FROM instances WHERE id = ?", (instance_id,)).fetchone()
+            if row is None:
+                raise InstanceNotFound(f"no instance {instance_id}")
+            rows = self._db.execute(
+                "SELECT seq, kind, event_id, request, response FROM instance_audit"
+                " WHERE instance_id = ? ORDER BY seq",
+                (instance_id,),
+            ).fetchall()
+        history = [
+            {"seq": seq, "kind": kind, "eventId": event_id,
+             "request": json.loads(request), "response": json.loads(response)}
+            for seq, kind, event_id, request, response in rows
+        ]
+        return {"id": instance_id, "workflow": row[0], "state": _read_state(row[1]), "history": history}
 
 
 def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
@@ -398,6 +454,8 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, {"workflows": sorted(engine._workflows)})
                 if len(parts) == 3 and parts[:2] == ["v1", "instances"]:
                     return self._send(200, engine.get(parts[2]))
+                if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "audit":
+                    return self._send(200, engine.audit(parts[2]))
                 return self._send(404, {"error": {"code": "not_found"}})
             except SagaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})

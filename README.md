@@ -97,6 +97,22 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 ### `GET /v1/instances/{id}`
 `200 {"id","workflow","state"}`；未知 id ⇒ `404 not_found`。
 
+### `GET /v1/instances/{id}/audit`
+实例级审计查询（只读，请求无正文）→ `200 {"id","workflow","state","history":[...]}`；
+未知 id ⇒ `404 not_found`。`state` 为查询时的当前状态；`history` 按 `seq` 从 1 开始严格递增，
+只收录**真正推进状态机**的调用（`/events` 记 `kind="event"`，`/signals` 记 `kind="signal"`）。
+每条记录：`{"seq","kind","eventId","request","response"}`：
+- `eventId`：该次调用提交的 `eventId`，未提交为 `null`；事件与信号复用同一字符串时由 `kind` 区分。
+- `request`：归一化输入（事件 `{"outcome","detail"}`，信号 `{"event","detail"}`；
+  省略 `detail` 与显式 `null` 均记为 `null`）。
+- `response`：该次处理返回的完整 JSON 响应（含当时的 `state`），无需重放状态机即可逐条核对。
+
+非法请求、`eventId` 冲突、终态推进、等待期间提交事件、信号名不匹配等被拒绝的调用不写审计；
+同一 `eventId` 的合法重放只返回首次响应，不新增记录。审计记录与状态更新、幂等账本**同一事务**
+提交（SQLite 表 `instance_audit`），并发接受的结果按某个确定串行顺序获得连续 `seq`；
+服务重开同一文件后 `history`、`seq` 与当前 `state` 一致。旧 SQLite 文件直接可读，
+旧实例的 `history` 从升级后的下一次成功推进开始积累，不为升级前的调用补录。
+
 ## 错误语义
 
 ```json
@@ -106,4 +122,4 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 ## 未实现（后续任务候选，非固定题单）
 
 超时与死信、并发与抢占、编排版本迁移与在飞实例、分区与顺序保证、
-持久化恢复与重放、限流与背压、可视化查询与审计回放、失败注入测试。
+持久化恢复与重放、限流与背压、失败注入测试。
