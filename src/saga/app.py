@@ -220,6 +220,18 @@ class Engine:
             "request TEXT NOT NULL, response TEXT NOT NULL, "
             "PRIMARY KEY (instance_id, event_id))"
         )
+        # Audit trail: one row per accepted (state-advancing) call, seq strictly
+        # increasing per instance from 1. Written in the same transaction as the
+        # state update and the ledger insert. IF NOT EXISTS keeps pre-audit files
+        # readable; old instances simply start accumulating history from their next
+        # successful advance — nothing is backfilled for calls we cannot prove.
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS instance_audit ("
+            "instance_id TEXT NOT NULL, seq INTEGER NOT NULL, "
+            "kind TEXT NOT NULL, event_id TEXT, "
+            "request TEXT NOT NULL, response TEXT NOT NULL, "
+            "PRIMARY KEY (instance_id, seq))"
+        )
         self._db.commit()
         self._workflows: dict[str, dict[str, Any]] = dict(WORKFLOWS)
 
@@ -263,12 +275,15 @@ class Engine:
         raises InvalidTransition. Nothing is written to the ledger unless the transition
         succeeds.
         """
-        normalized = None
-        if event_id is not _UNSET:
+        if event_id is _UNSET:
+            # Anonymous call: no ledger, but the audit trail still records the
+            # normalized input with a null eventId.
+            normalized = self._normalize_request(None, {"outcome": outcome, "detail": detail},
+                                                 ("eventId", "outcome", "detail"), anonymous=True)
+        else:
             normalized = self._normalize_request(event_id, {"outcome": outcome, "detail": detail},
                                                  ("eventId", "outcome", "detail"))
-            event_id = normalized["eventId"]
-        return self._commit(instance_id, "instance_events", event_id, normalized,
+        return self._commit(instance_id, "instance_events", "event", normalized,
                             lambda workflow, state: apply_outcome(workflow, state, outcome, detail))
 
     def signal(self, instance_id: str, event: Any, detail: Any = None, event_id: Any = _UNSET) -> dict[str, Any]:
@@ -280,27 +295,31 @@ class Engine:
         """
         if not isinstance(event, str) or not event or len(event) > 100:
             raise InvalidRequest("event must be a non-empty string of at most 100 characters")
-        normalized = None
-        if event_id is not _UNSET:
+        if event_id is _UNSET:
+            normalized = self._normalize_request(None, {"event": event, "detail": detail},
+                                                 ("eventId", "event", "detail"), anonymous=True)
+        else:
             normalized = self._normalize_request(event_id, {"event": event, "detail": detail},
                                                  ("eventId", "event", "detail"))
-            event_id = normalized["eventId"]
-        return self._commit(instance_id, "instance_signals", event_id, normalized,
+        return self._commit(instance_id, "instance_signals", "signal", normalized,
                             lambda workflow, state: apply_signal(workflow, state, event, detail))
 
-    def _commit(self, instance_id: str, table: str, event_id: Any, normalized: dict[str, Any] | None,
+    def _commit(self, instance_id: str, table: str, kind: str, normalized: dict[str, Any],
                 transition: Any) -> dict[str, Any]:
         """Shared idempotent commit for outcome events and signals.
 
-        Lookup, ledger replay, state transition and ledger insert happen under one
-        lock and in one transaction; the ledger primary key makes a racing duplicate
-        insert fail even if the lock were ever bypassed.
+        Lookup, ledger replay, state transition, ledger insert and audit append happen
+        under one lock and in one transaction; the ledger primary key makes a racing
+        duplicate insert fail even if the lock were ever bypassed. Only a call that
+        actually advances the state machine appends an audit row: replays return
+        before the transition and rejections raise before any write.
         """
+        event_id = normalized["eventId"]
         with self._lock:
             row = self._db.execute("SELECT workflow, state FROM instances WHERE id = ?", (instance_id,)).fetchone()
             if row is None:
                 raise InstanceNotFound(f"no instance {instance_id}")
-            if normalized is not None:
+            if event_id is not None:
                 ledger = self._db.execute(
                     f"SELECT request, response FROM {table} WHERE instance_id = ? AND event_id = ?",
                     (instance_id, event_id),
@@ -308,9 +327,9 @@ class Engine:
                 if ledger is not None:
                     stored_request, stored_response = ledger
                     if stored_request != json.dumps(normalized, separators=(",", ":"), sort_keys=True):
-                        kind = "signal" if table == "instance_signals" else "eventId"
+                        kind_label = "signal" if table == "instance_signals" else "eventId"
                         raise InvalidTransition(
-                            f"{kind} {event_id!r} was already submitted for this instance with a different payload"
+                            f"{kind_label} {event_id!r} was already submitted for this instance with a different payload"
                         )
                     return json.loads(stored_response)
             workflow = self.workflow(row[0])
@@ -318,24 +337,38 @@ class Engine:
             state = transition(workflow, state)
             response = {"id": instance_id, "workflow": row[0], "state": state}
             self._db.execute("UPDATE instances SET state = ? WHERE id = ?", (json.dumps(state), instance_id))
-            if normalized is not None:
+            if event_id is not None:
                 self._db.execute(
                     f"INSERT INTO {table} (instance_id, event_id, request, response) VALUES (?, ?, ?, ?)",
                     (instance_id, event_id,
                      json.dumps(normalized, separators=(",", ":"), sort_keys=True),
                      json.dumps(response)),
                 )
+            # Audit row for the accepted call, next seq per instance, same transaction.
+            self._db.execute(
+                "INSERT INTO instance_audit (instance_id, seq, kind, event_id, request, response) "
+                "SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ? FROM instance_audit WHERE instance_id = ?",
+                (instance_id, kind, event_id,
+                 json.dumps(normalized, separators=(",", ":"), sort_keys=True),
+                 json.dumps(response), instance_id),
+            )
             self._db.commit()
         return response
 
     @staticmethod
-    def _normalize_request(event_id: Any, payload: dict[str, Any], key_order: tuple[str, ...]) -> dict[str, Any]:
-        """Validate eventId and produce the canonical request used for replay comparison.
+    def _normalize_request(event_id: Any, payload: dict[str, Any], key_order: tuple[str, ...],
+                           anonymous: bool = False) -> dict[str, Any]:
+        """Validate eventId and produce the canonical request used for replay comparison
+        and for the audit trail.
 
         A missing detail and an explicit null detail are the same value, so the
         normalized form always carries ``"detail": null`` unless a detail was given.
+        With ``anonymous=True`` the call carried no eventId at all: validation is
+        skipped and the normalized form records ``"eventId": null``.
         """
-        if not isinstance(event_id, str) or not event_id or len(event_id) > 100:
+        if anonymous:
+            event_id = None
+        elif not isinstance(event_id, str) or not event_id or len(event_id) > 100:
             raise InvalidRequest("eventId must be a non-empty string of at most 100 characters")
         normalized: dict[str, Any] = {"eventId": event_id}
         for key in key_order:
@@ -351,6 +384,29 @@ class Engine:
         if row is None:
             raise InstanceNotFound(f"no instance {instance_id}")
         return {"id": instance_id, "workflow": row[0], "state": _read_state(row[1])}
+
+    def audit(self, instance_id: str) -> dict[str, Any]:
+        """Read-only audit view: current state plus the accepted calls in commit order.
+
+        History rows come back as ``{"seq", "kind", "eventId", "request", "response"}``
+        with seq strictly increasing from 1; instances that predate the audit table
+        simply have an empty (or short) history — nothing is fabricated.
+        """
+        with self._lock:
+            row = self._db.execute("SELECT workflow, state FROM instances WHERE id = ?", (instance_id,)).fetchone()
+            if row is None:
+                raise InstanceNotFound(f"no instance {instance_id}")
+            rows = self._db.execute(
+                "SELECT seq, kind, event_id, request, response FROM instance_audit "
+                "WHERE instance_id = ? ORDER BY seq",
+                (instance_id,),
+            ).fetchall()
+        history = [
+            {"seq": seq, "kind": kind, "eventId": event_id,
+             "request": json.loads(request), "response": json.loads(response)}
+            for seq, kind, event_id, request, response in rows
+        ]
+        return {"id": instance_id, "workflow": row[0], "state": _read_state(row[1]), "history": history}
 
 
 def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
@@ -398,6 +454,8 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, {"workflows": sorted(engine._workflows)})
                 if len(parts) == 3 and parts[:2] == ["v1", "instances"]:
                     return self._send(200, engine.get(parts[2]))
+                if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "audit":
+                    return self._send(200, engine.audit(parts[2]))
                 return self._send(404, {"error": {"code": "not_found"}})
             except SagaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})

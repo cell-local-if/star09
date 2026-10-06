@@ -10,7 +10,7 @@ import unittest
 import urllib.error
 import urllib.request
 
-from saga import Engine, InstanceNotFound, InvalidRequest, InvalidTransition, WORKFLOWS, apply_outcome, apply_signal, initial_state
+from saga import Engine, InstanceNotFound, InvalidRequest, InvalidTransition, SagaError, WORKFLOWS, apply_outcome, apply_signal, initial_state
 
 
 class TransitionUnitTests(unittest.TestCase):
@@ -1068,6 +1068,280 @@ class AwaitHttpTests(unittest.TestCase):
         status, replayed = self.call("POST", f"/v1/instances/{iid}/signals",
                                      {"event": "approved", "detail": {"by": "boss"}, "eventId": "sig-1"})
         self.assertEqual((status, replayed), (200, first))
+
+
+class AuditEngineTests(unittest.TestCase):
+    """Engine-level coverage of the per-instance audit trail."""
+
+    def setUp(self) -> None:
+        self.engine = Engine()
+        self.engine.define("approval", _await_workflow())
+
+    def tearDown(self) -> None:
+        self.engine.close()
+
+    def _start(self, workflow: str = "order") -> str:
+        return self.engine.start(workflow, {})["id"]
+
+    def test_new_instance_has_empty_history(self) -> None:
+        iid = self._start()
+        audit = self.engine.audit(iid)
+        self.assertEqual(audit["id"], iid)
+        self.assertEqual(audit["workflow"], "order")
+        self.assertEqual(audit["state"]["status"], "running")
+        self.assertEqual(audit["history"], [])
+
+    def test_missing_instance_audit_raises_not_found(self) -> None:
+        with self.assertRaises(InstanceNotFound):
+            self.engine.audit("no-such-instance")
+
+    def test_accepted_events_recorded_in_seq_order(self) -> None:
+        iid = self._start()
+        first = self.engine.advance(iid, "succeeded", event_id="e-1")
+        second = self.engine.advance(iid, "succeeded", {"note": "d"}, event_id="e-2")
+        third = self.engine.advance(iid, "succeeded")  # anonymous call
+        audit = self.engine.audit(iid)
+        self.assertEqual(audit["state"]["status"], "completed")
+        history = audit["history"]
+        self.assertEqual([h["seq"] for h in history], [1, 2, 3])
+        self.assertEqual([h["kind"] for h in history], ["event", "event", "event"])
+        self.assertEqual([h["eventId"] for h in history], ["e-1", "e-2", None])
+        self.assertEqual(history[0]["request"],
+                         {"eventId": "e-1", "outcome": "succeeded", "detail": None})
+        self.assertEqual(history[1]["request"],
+                         {"eventId": "e-2", "outcome": "succeeded", "detail": {"note": "d"}})
+        self.assertEqual(history[2]["request"],
+                         {"eventId": None, "outcome": "succeeded", "detail": None})
+        # Each record keeps the full response returned at the time.
+        self.assertEqual(history[0]["response"], first)
+        self.assertEqual(history[1]["response"], second)
+        self.assertEqual(history[2]["response"], third)
+
+    def test_signals_and_events_share_one_sequence_distinguished_by_kind(self) -> None:
+        iid = self._start("approval")
+        sig = self.engine.signal(iid, "approved", {"by": "boss"}, event_id="shared-id")
+        evt = self.engine.advance(iid, "succeeded", event_id="shared-id")  # same id, other kind
+        done = self.engine.signal(iid, "shipped")
+        history = self.engine.audit(iid)["history"]
+        self.assertEqual([h["seq"] for h in history], [1, 2, 3])
+        self.assertEqual([h["kind"] for h in history], ["signal", "event", "signal"])
+        self.assertEqual([h["eventId"] for h in history], ["shared-id", "shared-id", None])
+        self.assertEqual(history[0]["request"],
+                         {"eventId": "shared-id", "event": "approved", "detail": {"by": "boss"}})
+        self.assertEqual(history[0]["response"], sig)
+        self.assertEqual(history[1]["response"], evt)
+        self.assertEqual(history[2]["response"], done)
+        self.assertEqual(history[2]["request"],
+                         {"eventId": None, "event": "shipped", "detail": None})
+
+    def test_omitted_and_null_detail_both_recorded_as_null(self) -> None:
+        iid = self._start()
+        self.engine.advance(iid, "succeeded", event_id="e-1")          # detail omitted
+        self.engine.advance(iid, "succeeded", None, event_id="e-2")    # explicit null
+        history = self.engine.audit(iid)["history"]
+        self.assertIsNone(history[0]["request"]["detail"])
+        self.assertIsNone(history[1]["request"]["detail"])
+
+    def test_rejected_calls_append_nothing(self) -> None:
+        iid = self._start("approval")
+        rejections = [
+            lambda: self.engine.advance(iid, "bogus", event_id="r-1"),       # invalid outcome
+            lambda: self.engine.advance(iid, "succeeded", event_id="r-2"),   # waiting for signal
+            lambda: self.engine.advance(iid, "succeeded", event_id=""),      # bad eventId
+            lambda: self.engine.signal(iid, "rejected", event_id="r-3"),     # mismatched signal
+            lambda: self.engine.signal("missing", "approved", event_id="r-4"),
+            lambda: self.engine.advance("missing", "succeeded", event_id="r-5"),
+        ]
+        for reject in rejections:
+            with self.assertRaises(SagaError):
+                reject()
+        self.assertEqual(self.engine.audit(iid)["history"], [])
+        # A conflicting resubmission of an accepted eventId is also not audited.
+        self.engine.signal(iid, "approved", event_id="ok-1")
+        with self.assertRaises(InvalidTransition):
+            self.engine.signal(iid, "approved", {"different": 1}, event_id="ok-1")
+        history = self.engine.audit(iid)["history"]
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["eventId"], "ok-1")
+
+    def test_terminal_advance_attempts_append_nothing(self) -> None:
+        iid = self._start()
+        self.engine.advance(iid, "failed", event_id="fin")
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="after-end")
+        with self.assertRaises(InvalidTransition):
+            self.engine.signal(iid, "anything", event_id="after-end-2")
+        history = self.engine.audit(iid)["history"]
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["eventId"], "fin")
+        self.assertEqual(history[0]["response"]["state"]["status"], "compensated")
+
+    def test_replay_returns_first_response_and_appends_nothing(self) -> None:
+        iid = self._start()
+        first = self.engine.advance(iid, "succeeded", event_id="e-1")
+        self.engine.advance(iid, "succeeded", event_id="e-2")
+        self.engine.advance(iid, "succeeded", event_id="e-3")  # terminal
+        replay = self.engine.advance(iid, "succeeded", event_id="e-1")
+        self.assertEqual(replay, first)
+        history = self.engine.audit(iid)["history"]
+        self.assertEqual([h["seq"] for h in history], [1, 2, 3])
+        self.assertEqual([h["eventId"] for h in history], ["e-1", "e-2", "e-3"])
+        # The replayed response is exactly what the first audit record stored.
+        self.assertEqual(history[0]["response"], replay)
+
+    def test_concurrent_distinct_ids_get_contiguous_seqs(self) -> None:
+        iid = self._start()
+        barrier = threading.Barrier(3)
+        errors: list[Exception] = []
+
+        def submit(index: int) -> None:
+            try:
+                barrier.wait()
+                self.engine.advance(iid, "succeeded", event_id=f"ev-{index}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=submit, args=(i,)) for i in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        history = self.engine.audit(iid)["history"]
+        self.assertEqual([h["seq"] for h in history], [1, 2, 3])
+        self.assertEqual(sorted(h["eventId"] for h in history), ["ev-0", "ev-1", "ev-2"])
+        # Responses recorded in audit order reflect a valid serial progression.
+        self.assertEqual(history[-1]["response"]["state"]["status"], "completed")
+
+
+class AuditPersistenceTests(unittest.TestCase):
+    """Audit history survives reopen; pre-audit files stay readable without backfill."""
+
+    def setUp(self) -> None:
+        fd, self.path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+
+    def tearDown(self) -> None:
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+    def test_history_and_state_consistent_across_reopen(self) -> None:
+        engine = Engine(self.path)
+        engine.define("approval", _await_workflow())
+        iid = engine.start("approval", {})["id"]
+        first = engine.signal(iid, "approved", event_id="s-1")
+        second = engine.advance(iid, "succeeded", event_id="e-1")
+        engine.close()
+
+        engine = Engine(self.path)
+        try:
+            engine.define("approval", _await_workflow())
+            audit = engine.audit(iid)
+            self.assertEqual(audit["state"]["waitingFor"], "shipped")
+            history = audit["history"]
+            self.assertEqual([h["seq"] for h in history], [1, 2])
+            self.assertEqual([h["kind"] for h in history], ["signal", "event"])
+            self.assertEqual(history[0]["response"], first)
+            self.assertEqual(history[1]["response"], second)
+            # New accepted calls continue the sequence after reopen.
+            third = engine.signal(iid, "shipped", event_id="s-2")
+            history = engine.audit(iid)["history"]
+            self.assertEqual([h["seq"] for h in history], [1, 2, 3])
+            self.assertEqual(history[2]["response"], third)
+            self.assertEqual(engine.audit(iid)["state"]["status"], "completed")
+        finally:
+            engine.close()
+
+    def test_legacy_file_without_audit_table_works_and_is_not_backfilled(self) -> None:
+        legacy = sqlite3.connect(self.path)
+        legacy.execute("CREATE TABLE instances (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, state TEXT NOT NULL)")
+        state = initial_state(WORKFLOWS["order"], {})
+        state = apply_outcome(WORKFLOWS["order"], state, "succeeded")
+        legacy.execute("INSERT INTO instances VALUES (?, ?, ?)",
+                       ("legacy-id", "order", json.dumps(state)))
+        legacy.commit()
+        legacy.close()
+
+        engine = Engine(self.path)
+        try:
+            # Pre-upgrade advances are not fabricated: history starts empty even
+            # though the instance is already mid-flight.
+            audit = engine.audit("legacy-id")
+            self.assertEqual(audit["state"]["completed"], ["reserve-stock"])
+            self.assertEqual(audit["history"], [])
+            # Existing reads and idempotent replay keep working.
+            result = engine.advance("legacy-id", "succeeded", event_id="new-era-1")
+            self.assertEqual(engine.advance("legacy-id", "succeeded", event_id="new-era-1"), result)
+            # History accumulates from the first accepted call after the upgrade.
+            history = engine.audit("legacy-id")["history"]
+            self.assertEqual([h["seq"] for h in history], [1])
+            self.assertEqual(history[0]["eventId"], "new-era-1")
+            self.assertEqual(history[0]["response"], result)
+        finally:
+            engine.close()
+
+
+class AuditHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from saga import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def call(self, method: str, path: str, body: dict | None = None):
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def test_audit_endpoint_end_to_end(self) -> None:
+        self.call("PUT", "/v1/workflows/audited", {"steps": [
+            {"name": "s1", "compensation": "c1", "await": {"event": "go"}},
+            {"name": "s2", "compensation": "c2"},
+        ]})
+        status, body = self.call("POST", "/v1/workflows/audited/instances", {"context": {"k": "v"}})
+        iid = body["id"]
+        # A rejected call and a replay must not appear in the history.
+        self.call("POST", f"/v1/instances/{iid}/events", {"outcome": "succeeded"})
+        status, sig = self.call("POST", f"/v1/instances/{iid}/signals",
+                                {"event": "go", "eventId": "sig-1"})
+        self.assertEqual(status, 200)
+        self.call("POST", f"/v1/instances/{iid}/signals", {"event": "go", "eventId": "sig-1"})
+        status, evt = self.call("POST", f"/v1/instances/{iid}/events",
+                                {"outcome": "succeeded", "detail": None})
+        self.assertEqual(status, 200)
+
+        status, audit = self.call("GET", f"/v1/instances/{iid}/audit")
+        self.assertEqual(status, 200)
+        self.assertEqual(audit["id"], iid)
+        self.assertEqual(audit["workflow"], "audited")
+        self.assertEqual(audit["state"]["status"], "completed")
+        history = audit["history"]
+        self.assertEqual([h["seq"] for h in history], [1, 2])
+        self.assertEqual([h["kind"] for h in history], ["signal", "event"])
+        self.assertEqual(history[0]["eventId"], "sig-1")
+        self.assertEqual(history[0]["request"],
+                         {"eventId": "sig-1", "event": "go", "detail": None})
+        self.assertEqual(history[0]["response"], sig)
+        self.assertIsNone(history[1]["eventId"])
+        self.assertEqual(history[1]["request"],
+                         {"eventId": None, "outcome": "succeeded", "detail": None})
+        self.assertEqual(history[1]["response"], evt)
+
+    def test_audit_unknown_instance_is_404(self) -> None:
+        status, body = self.call("GET", "/v1/instances/missing/audit")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "not_found")
 
 
 if __name__ == "__main__":

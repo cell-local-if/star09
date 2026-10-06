@@ -97,6 +97,23 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 ### `GET /v1/instances/{id}`
 `200 {"id","workflow","state"}`；未知 id ⇒ `404 not_found`。
 
+### `GET /v1/instances/{id}/audit`
+实例级只读审计查询（无请求体）→ `200 {"id","workflow","state","history":[...]}`；未知 id ⇒ `404 not_found`。
+- `state` 为查询时的当前状态（与 `GET /v1/instances/{id}` 一致）；`history` 按 `seq` 从 1 开始严格递增，
+  只收录**真正推进状态机**的 `/events` 与 `/signals` 调用。
+- 每条记录：`{"seq","kind","eventId","request","response"}`；`kind` 为 `event`（/events）或
+  `signal`（/signals），同一 `eventId` 字符串被事件与信号复用时通过 `kind` 区分。
+- `request` 保存归一化输入（`eventId`/`outcome`/`detail` 或 `eventId`/`event`/`detail`）；
+  未提交 `eventId` 时记录中的 `eventId` 为 `null`；省略 `detail` 与显式 `null` 都记为 `null`。
+- `response` 保存该次处理返回的完整 JSON 响应，无需重新执行状态机即可逐条核对当时结果。
+- 幂等回放（相同 `eventId` 相同载荷）仍只返回首次响应且只占一条审计记录，即使实例后来已终态；
+  非法请求、相同 `eventId` 不同载荷、终态推进、等待期间提交事件、信号名不匹配等被拒绝的调用
+  均不追加记录。不同 `eventId` 的并发接受结果按某个确定串行顺序获得连续 `seq`。
+- 审计记录与状态更新、幂等账本在**同一事务**提交（SQLite 表 `instance_audit`），
+  服务重开同一文件后 `history`、`seq` 与当前 `state` 保持一致。
+- 新表以 `CREATE TABLE IF NOT EXISTS` 建立，旧 SQLite 文件直接可读且既有读取与回放行为不变；
+  升级前的调用**不伪造补录**，旧实例从升级后的下一次成功推进开始积累历史。
+
 ## 错误语义
 
 ```json
