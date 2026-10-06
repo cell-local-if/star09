@@ -39,17 +39,29 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 `200 {"workflows": ["order","provision", ...]}`（字典序；内置 `order`、`provision`）
 
 ### `PUT /v1/workflows/{name}`
-请求体 = 工作流定义 → `200 {"workflow": name, "steps": [...]}`。
+请求体 = 工作流定义 → `200 {"workflow": name, "version": <int>, "steps": [...]}`。
 定义非法（step 非对象、`name` 空/超 100 字符、未知字段、步数越界）⇒ `400 invalid_request`。
 步骤的 `retry` 只允许 `{"maxAttempts": n}`（整数，2–10）；`retry` 缺失 `maxAttempts`、含未知字段、
 值为布尔/非整数、小于 2 或大于 10 ⇒ `400 invalid_request`，已有定义保持不变。
 
+**版本**：每次合法提交生成一个**不可变版本**（SQLite 表 `workflow_versions`，`(name, version)` 主键，
+只插不改）；内置 `order`、`provision` 从版本 1 开始，后续 PUT 依次得到 2、3…；
+非法提交不产生新版本。已生成的版本永不改写，重开同一文件后自定义定义与版本序号仍然存在。
+
+### `GET /v1/workflows/{name}`
+`200 {"workflow": name, "version": <最新版本号>, "steps": [...]}`；未知工作流 ⇒ `404 not_found`。
+
 ### `POST /v1/workflows/{name}/instances`
-请求体：`{"context": {...}}`（可省）→ **`201`** `{"id": <uuid>, "workflow": name, "state": {...}}`。
+请求体：`{"context": {...}, "version": <可选正整数>}`（均可省）→
+**201** `{"id": <uuid>, "workflow": name, "workflowVersion": <int>, "state": {...}}`。
+省略 `version` 启动最新版；指定正整数则把实例**固定**到该版本——之后同名定义再 PUT 新版本
+不影响该实例的推进语义。`version` 非正整数（含布尔、小数、字符串）⇒ `400 invalid_request`；
+版本不存在 ⇒ `404 not_found`；未知工作流名 ⇒ `400 invalid_request`（同基线）。
+实例的 `workflowVersion` 随实例行持久化（`instances.version` 列），重开后保持一致。
 
 ### `POST /v1/instances/{id}/events`
 请求体：`{"outcome": "succeeded"|"failed"|"timed_out", "detail": <任意 JSON>, "eventId": "<可选>"}` →
-`200 {"id":..., "workflow":..., "state": {...}}`。
+`200 {"id":..., "workflow":..., "workflowVersion": <推进所用版本>, "state": {...}}`。
 - `succeeded`：推进到下一步（`attempt` 重置为 1，`failure` 清除）；已是最后一步 ⇒ `status="completed"`。
 - `failed`：
   - 当前步骤配置了 `retry` 且 `attempt < maxAttempts`：实例保持 `running`，`step`/`index` 不变，
@@ -71,7 +83,7 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 
 ### `POST /v1/instances/{id}/signals`
 请求体：`{"event": "<事件名>", "detail": <任意 JSON>, "eventId": "<可选>"}` →
-`200 {"id":..., "workflow":..., "state": {...}}`。
+`200 {"id":..., "workflow":..., "workflowVersion":..., "state": {...}}`。
 - 仅当实例 `running` 且当前步骤 `waitingFor` 与 `event` 相同才接受：当前步骤按**成功结果**完成
   （`completed` 加入步骤名，`failure` 清除，`attempt` 重置为 1）并进入下一步；下一步仍带 `await`
   则 `waitingFor` 更新为新事件名（带 `timeoutMs` 时同时设置新的 `deadlineAt`）；若已是最后一步则
@@ -113,11 +125,29 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
   等待状态（含 `deadlineAt`）随实例状态持久化、信号幂等记录随 `instance_signals` 持久化，
   重开服务后等待、死信状态、`failure` 与回放结果一致。
 
+### `POST /v1/instances/{id}/migrate`
+在飞迁移：把 `running` 实例重新固定到**同名工作流的另一个现存版本**。
+请求体：`{"version": <正整数>}` → `200 {"id","workflow","workflowVersion","state"}`。
+- 兼容性：目标版本的步骤总数与有序步骤名须与当前版本一致，且当前 `index` 对应步骤及之前
+  所有步骤的定义（name/compensation/retry/await）完全一致；只有**未进入步骤**的
+  compensation/retry/await 允许调整。
+- 迁移成功只改变版本归属：`status`/`step`/`index`/`attempt`/`completed`/`compensated`/
+  `context`/`failure`/`waitingFor`/`deadlineAt` 全部原样保留，后续推进按目标版本定义执行；
+  不写幂等账本、不追加审计记录。
+- `version` 缺失或非正整数 ⇒ `400 invalid_request`；实例不存在或目标版本不存在 ⇒
+  `404 not_found`；实例已终态、步骤序列不兼容、已进入步骤定义不同 ⇒ `409 invalid_transition`。
+  所有拒绝都不改变状态、账本与审计。
+- 未固定版本的旧实例（`workflowVersion` 为 `null`）按"当前跟随最新版"衡量兼容性，
+  迁移成功的同时完成版本固定。
+- 历史响应保留事件发生时的版本：迁移不改写幂等账本与审计记录中已存的 `workflowVersion`。
+
 ### `GET /v1/instances/{id}`
-`200 {"id","workflow","state"}`；未知 id ⇒ `404 not_found`。
+`200 {"id","workflow","workflowVersion","state"}`；未知 id ⇒ `404 not_found`。
+旧 SQLite 文件（无 `version` 列）中的实例 `workflowVersion` 为 `null`；
+该实例首次成功推进时按当时最新版补记并固定，之后的查询与响应都携带该版本。
 
 ### `GET /v1/instances/{id}/audit`
-实例级只读审计查询（无请求体）→ `200 {"id","workflow","state","history":[...]}`；未知 id ⇒ `404 not_found`。
+实例级只读审计查询（无请求体）→ `200 {"id","workflow","workflowVersion","state","history":[...]}`；未知 id ⇒ `404 not_found`。
 - `state` 为查询时的当前状态（与 `GET /v1/instances/{id}` 一致）；`history` 按 `seq` 从 1 开始严格递增，
   只收录**真正推进状态机**的 `/events` 与 `/signals` 调用。
 - 每条记录：`{"seq","kind","eventId","request","response"}`；`kind` 为 `event`（/events）或
@@ -142,5 +172,5 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 
 ## 未实现（后续任务候选，非固定题单）
 
-并发与抢占、编排版本迁移与在飞实例、分区与顺序保证、
+并发与抢占、分区与顺序保证、
 持久化恢复与重放、限流与背压、可视化查询与审计回放、失败注入测试。
