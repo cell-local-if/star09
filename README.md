@@ -20,6 +20,11 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
   事件名为 ≤100 字符的非空字符串；`timeoutMs` 为等待超时毫秒数（布尔、小数、非整数、越界均非法）。
   含未知字段、缺 `event`、空值或非法类型 ⇒ `400 invalid_request`，已有同名定义保持不变；
   不带 `timeoutMs` 的 `await` 保持原有语义（无限期等待）。
+- **定义版本**：每次合法 `PUT` 为同名工作流追加一个**不可变版本**（整数，从 1 开始单调递增；
+  内置 `order`、`provision` 预置为版本 1）。版本持久化在 SQLite 表 `workflow_versions`，
+  从不更新或删除，重开同一文件后自定义定义与全部历史版本仍在。
+  每个实例启动时**固定**一个版本（省略则为当时最新版），后续 `PUT` 不影响在飞实例；
+  实例推进、重试、补偿与等待判定一律使用固定版本的定义。
 - **实例状态**：`{"status":"running|completed|compensated|dead_lettered", "step": <当前步骤名或 null>, "index": <int>,
   "attempt": <当前步骤的尝试序号，从 1 开始，进入新步骤时重置为 1>,
   "completed":[<已完成步骤名>], "compensated":[<将/已执行的补偿名，逆序>], "context": {...}, "failure": null|{...},
@@ -39,17 +44,26 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 `200 {"workflows": ["order","provision", ...]}`（字典序；内置 `order`、`provision`）
 
 ### `PUT /v1/workflows/{name}`
-请求体 = 工作流定义 → `200 {"workflow": name, "steps": [...]}`。
-定义非法（step 非对象、`name` 空/超 100 字符、未知字段、步数越界）⇒ `400 invalid_request`。
+请求体 = 工作流定义 → `200 {"workflow": name, "version": <新版本号>, "steps": [...]}`。
+每次合法提交追加一个不可变版本（首个版本为 1，之后 2、3、…），已有版本永不被改写。
+定义非法（step 非对象、`name` 空/超 100 字符、未知字段、步数越界）⇒ `400 invalid_request`，
+已有定义与版本序列保持不变。
 步骤的 `retry` 只允许 `{"maxAttempts": n}`（整数，2–10）；`retry` 缺失 `maxAttempts`、含未知字段、
 值为布尔/非整数、小于 2 或大于 10 ⇒ `400 invalid_request`，已有定义保持不变。
 
+### `GET /v1/workflows/{name}`
+`200 {"workflow": name, "version": <最新版本号>, "steps": [...]}`；未知工作流 ⇒ `404 not_found`。
+
 ### `POST /v1/workflows/{name}/instances`
-请求体：`{"context": {...}}`（可省）→ **`201`** `{"id": <uuid>, "workflow": name, "state": {...}}`。
+请求体：`{"context": {...}, "version": <可选正整数>}`（均可省）→ **`201`**
+`{"id": <uuid>, "workflow": name, "workflowVersion": <固定的版本号>, "state": {...}}`。
+省略 `version` 启动当时最新版；指定正整数则固定到该现存版本。
+`version` 非正整数（含布尔、小数、字符串、0、负数）⇒ `400 invalid_request`；
+版本不存在 ⇒ `404 not_found`；未知工作流（未指定版本）⇒ `400 invalid_request`。
 
 ### `POST /v1/instances/{id}/events`
 请求体：`{"outcome": "succeeded"|"failed"|"timed_out", "detail": <任意 JSON>, "eventId": "<可选>"}` →
-`200 {"id":..., "workflow":..., "state": {...}}`。
+`200 {"id":..., "workflow":..., "workflowVersion":..., "state": {...}}`。
 - `succeeded`：推进到下一步（`attempt` 重置为 1，`failure` 清除）；已是最后一步 ⇒ `status="completed"`。
 - `failed`：
   - 当前步骤配置了 `retry` 且 `attempt < maxAttempts`：实例保持 `running`，`step`/`index` 不变，
@@ -71,7 +85,7 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 
 ### `POST /v1/instances/{id}/signals`
 请求体：`{"event": "<事件名>", "detail": <任意 JSON>, "eventId": "<可选>"}` →
-`200 {"id":..., "workflow":..., "state": {...}}`。
+`200 {"id":..., "workflow":..., "workflowVersion":..., "state": {...}}`。
 - 仅当实例 `running` 且当前步骤 `waitingFor` 与 `event` 相同才接受：当前步骤按**成功结果**完成
   （`completed` 加入步骤名，`failure` 清除，`attempt` 重置为 1）并进入下一步；下一步仍带 `await`
   则 `waitingFor` 更新为新事件名（带 `timeoutMs` 时同时设置新的 `deadlineAt`）；若已是最后一步则
@@ -112,12 +126,30 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
   不含 `deadlineAt` 字段的旧实例同样按 `null` 读取（等待无超时，`timed_out` 对其返回 `409`）。
   等待状态（含 `deadlineAt`）随实例状态持久化、信号幂等记录随 `instance_signals` 持久化，
   重开服务后等待、死信状态、`failure` 与回放结果一致。
+- 实例的固定版本随实例行持久化（`instances.version` 列，旧文件自动 `ALTER TABLE` 补齐、
+  旧实例为 `NULL`）；工作流定义随 `workflow_versions` 持久化，重开同一文件后自定义实例
+  仍能拿到启动时的定义，版本归属与回放响应（含其中的 `workflowVersion`）保持不变。
 
 ### `GET /v1/instances/{id}`
-`200 {"id","workflow","state"}`；未知 id ⇒ `404 not_found`。
+`200 {"id","workflow","workflowVersion","state"}`；未知 id ⇒ `404 not_found`。
+`workflowVersion` 为实例固定的定义版本；版本化之前持久化的旧实例（SQLite 中无版本字段）返回
+`null`，并在首次成功推进时补记当时最新版（之后照常固定）。
+
+### `POST /v1/instances/{id}/migrate`
+请求体：`{"version": <正整数>}` → `200 {"id","workflow","workflowVersion","state"}`。
+把 **running** 实例重新固定到同名工作流的另一个**现存版本**：
+- 目标版本的步骤总数与有序步骤名必须与当前版本一致；
+- 当前 `index` 对应步骤及之前所有步骤的定义（`name`/`compensation`/`retry`/`await`）必须完全一致，
+  只有**未进入**步骤的 `compensation`、`retry`、`await` 允许不同；
+- 迁移不改写状态：`status`、`step`、`index`、`attempt`、`completed`、`compensated`、`context`、
+  `failure`、`waitingFor`、`deadlineAt` 全部保留，后续推进改用目标版本定义；
+- 迁移不写幂等账本、不追加审计记录；账本与审计中已存的历史响应保留事件发生时的版本，永不改写。
+- `version` 缺失或非正整数 ⇒ `400 invalid_request`；实例不存在或版本不存在 ⇒ `404 not_found`；
+  实例已终态、实例尚无版本记录、步骤序列不兼容或已进入步骤定义不同
+  ⇒ `409 invalid_transition`，且状态、账本、审计均不变。
 
 ### `GET /v1/instances/{id}/audit`
-实例级只读审计查询（无请求体）→ `200 {"id","workflow","state","history":[...]}`；未知 id ⇒ `404 not_found`。
+实例级只读审计查询（无请求体）→ `200 {"id","workflow","workflowVersion","state","history":[...]}`；未知 id ⇒ `404 not_found`。
 - `state` 为查询时的当前状态（与 `GET /v1/instances/{id}` 一致）；`history` 按 `seq` 从 1 开始严格递增，
   只收录**真正推进状态机**的 `/events` 与 `/signals` 调用。
 - 每条记录：`{"seq","kind","eventId","request","response"}`；`kind` 为 `event`（/events）或
@@ -142,5 +174,5 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 
 ## 未实现（后续任务候选，非固定题单）
 
-并发与抢占、编排版本迁移与在飞实例、分区与顺序保证、
+并发与抢占、分区与顺序保证、
 持久化恢复与重放、限流与背压、可视化查询与审计回放、失败注入测试。

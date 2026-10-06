@@ -24,8 +24,12 @@ class InvalidRequest(SagaError):
     code, status = "invalid_request", 400
 
 
-class InstanceNotFound(SagaError):
+class NotFound(SagaError):
     code, status = "not_found", 404
+
+
+class InstanceNotFound(NotFound):
+    pass
 
 
 class InvalidTransition(SagaError):
@@ -275,6 +279,27 @@ class Engine:
         self._lock = threading.RLock()
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.execute("CREATE TABLE IF NOT EXISTS instances (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, state TEXT NOT NULL)")
+        # Version pinning: each instance records the workflow version it runs against.
+        # Files created by older builds lack the column; it is added with NULL, and a
+        # NULL version reads back as workflowVersion null until the first successful
+        # advance backfills the then-latest version.
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(instances)")}
+        if "version" not in columns:
+            self._db.execute("ALTER TABLE instances ADD COLUMN version INTEGER")
+        # Immutable workflow definitions: one row per (name, version), never updated
+        # or deleted, so a pinned instance always finds the exact definition it
+        # started with — including after the process reopens the same file.
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS workflow_versions ("
+            "name TEXT NOT NULL, version INTEGER NOT NULL, definition TEXT NOT NULL, "
+            "PRIMARY KEY (name, version))"
+        )
+        # Built-in workflows seed version 1; later PUTs of the same name add 2, 3, ...
+        for builtin, definition in WORKFLOWS.items():
+            self._db.execute(
+                "INSERT OR IGNORE INTO workflow_versions (name, version, definition) VALUES (?, 1, ?)",
+                (builtin, json.dumps(definition)),
+            )
         # Idempotent event ledger: one row per (instance, eventId). IF NOT EXISTS keeps
         # files created by older builds readable; old instances simply start with an
         # empty ledger and can accept eventIds on their next advance.
@@ -306,36 +331,95 @@ class Engine:
             "PRIMARY KEY (instance_id, seq))"
         )
         self._db.commit()
-        self._workflows: dict[str, dict[str, Any]] = dict(WORKFLOWS)
 
     def close(self) -> None:
         with self._lock:
             self._db.close()
 
     def define(self, name: str, payload: Any) -> dict[str, Any]:
+        """Append a new immutable version of *name* and return it with its version.
+
+        Validation is unchanged from the baseline; a rejected payload leaves every
+        existing version untouched. Versions are per-name monotonically increasing
+        integers (built-ins seed 1), persisted so they survive reopening the file.
+        """
         if not isinstance(name, str) or not name or len(name) > 100:
             raise InvalidRequest("workflow name must be a non-empty string of at most 100 characters")
         workflow = validate_workflow(payload)
         with self._lock:
-            self._workflows[name] = workflow
-        return workflow
+            row = self._db.execute(
+                "SELECT MAX(version) FROM workflow_versions WHERE name = ?", (name,)
+            ).fetchone()
+            version = (row[0] or 0) + 1
+            self._db.execute(
+                "INSERT INTO workflow_versions (name, version, definition) VALUES (?, ?, ?)",
+                (name, version, json.dumps(workflow)),
+            )
+            self._db.commit()
+        return {"steps": workflow["steps"], "version": version}
 
-    def workflow(self, name: str) -> dict[str, Any]:
+    def workflow_names(self) -> list[str]:
         with self._lock:
-            if name not in self._workflows:
-                raise InvalidRequest(f"unknown workflow {name!r}")
-            return self._workflows[name]
+            rows = self._db.execute("SELECT DISTINCT name FROM workflow_versions").fetchall()
+        return sorted(row[0] for row in rows)
 
-    def start(self, name: str, context: Any = None) -> dict[str, Any]:
+    def workflow(self, name: str, version: int | None = None) -> dict[str, Any]:
+        """The definition of *name* at *version* (latest when omitted).
+
+        Unknown names raise InvalidRequest (the baseline behavior for starting an
+        instance); a known name with an unknown version raises NotFound.
+        """
+        with self._lock:
+            if version is None:
+                row = self._db.execute(
+                    "SELECT definition FROM workflow_versions WHERE name = ? "
+                    "ORDER BY version DESC LIMIT 1",
+                    (name,),
+                ).fetchone()
+                if row is None:
+                    raise InvalidRequest(f"unknown workflow {name!r}")
+            else:
+                row = self._db.execute(
+                    "SELECT definition FROM workflow_versions WHERE name = ? AND version = ?",
+                    (name, version),
+                ).fetchone()
+                if row is None:
+                    raise NotFound(f"unknown version {version} for workflow {name!r}")
+        return json.loads(row[0])
+
+    def workflow_info(self, name: str) -> dict[str, Any]:
+        """Latest version of *name* as {"workflow", "version", "steps"}; 404 if unknown."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT version, definition FROM workflow_versions WHERE name = ? "
+                "ORDER BY version DESC LIMIT 1",
+                (name,),
+            ).fetchone()
+        if row is None:
+            raise NotFound(f"unknown workflow {name!r}")
+        return {"workflow": name, "version": row[0], "steps": json.loads(row[1])["steps"]}
+
+    def start(self, name: str, context: Any = None, version: Any = None) -> dict[str, Any]:
         if context is not None and not isinstance(context, dict):
             raise InvalidRequest("context must be a JSON object when present")
-        workflow = self.workflow(name)
-        instance_id = str(uuid.uuid4())
-        state = initial_state(workflow, context or {})
+        if version is not None and (isinstance(version, bool) or not isinstance(version, int) or version < 1):
+            raise InvalidRequest("version must be a positive integer when present")
         with self._lock:
-            self._db.execute("INSERT INTO instances VALUES (?, ?, ?)", (instance_id, name, json.dumps(state)))
+            # Definition and version number resolve in one critical section, so a
+            # concurrent PUT cannot slip a new version between the two lookups.
+            workflow = self.workflow(name, version)
+            if version is None:
+                version = self._db.execute(
+                    "SELECT MAX(version) FROM workflow_versions WHERE name = ?", (name,)
+                ).fetchone()[0]
+            instance_id = str(uuid.uuid4())
+            state = initial_state(workflow, context or {})
+            self._db.execute(
+                "INSERT INTO instances (id, workflow, state, version) VALUES (?, ?, ?, ?)",
+                (instance_id, name, json.dumps(state), version),
+            )
             self._db.commit()
-        return {"id": instance_id, "workflow": name, "state": state}
+        return {"id": instance_id, "workflow": name, "workflowVersion": version, "state": state}
 
     def advance(self, instance_id: str, outcome: Any, detail: Any = None, event_id: Any = _UNSET) -> dict[str, Any]:
         """Apply one outcome event atomically.
@@ -389,7 +473,7 @@ class Engine:
         """
         event_id = normalized["eventId"]
         with self._lock:
-            row = self._db.execute("SELECT workflow, state FROM instances WHERE id = ?", (instance_id,)).fetchone()
+            row = self._db.execute("SELECT workflow, state, version FROM instances WHERE id = ?", (instance_id,)).fetchone()
             if row is None:
                 raise InstanceNotFound(f"no instance {instance_id}")
             if event_id is not None:
@@ -405,11 +489,21 @@ class Engine:
                             f"{kind_label} {event_id!r} was already submitted for this instance with a different payload"
                         )
                     return json.loads(stored_response)
-            workflow = self.workflow(row[0])
+            # The instance advances against the definition of its pinned version, so a
+            # later PUT of the same name never affects in-flight instances. Instances
+            # persisted before versioning existed (version NULL) resolve the latest
+            # version now and backfill it on this first successful advance.
+            version = row[2]
+            workflow = self.workflow(row[0], version)
+            if version is None:
+                version = self._db.execute(
+                    "SELECT MAX(version) FROM workflow_versions WHERE name = ?", (row[0],)
+                ).fetchone()[0]
             state = _read_state(row[1])
             state = transition(workflow, state)
-            response = {"id": instance_id, "workflow": row[0], "state": state}
-            self._db.execute("UPDATE instances SET state = ? WHERE id = ?", (json.dumps(state), instance_id))
+            response = {"id": instance_id, "workflow": row[0], "workflowVersion": version, "state": state}
+            self._db.execute("UPDATE instances SET state = ?, version = ? WHERE id = ?",
+                             (json.dumps(state), version, instance_id))
             if event_id is not None:
                 self._db.execute(
                     f"INSERT INTO {table} (instance_id, event_id, request, response) VALUES (?, ?, ?, ?)",
@@ -453,10 +547,63 @@ class Engine:
 
     def get(self, instance_id: str) -> dict[str, Any]:
         with self._lock:
-            row = self._db.execute("SELECT workflow, state FROM instances WHERE id = ?", (instance_id,)).fetchone()
+            row = self._db.execute("SELECT workflow, state, version FROM instances WHERE id = ?", (instance_id,)).fetchone()
         if row is None:
             raise InstanceNotFound(f"no instance {instance_id}")
-        return {"id": instance_id, "workflow": row[0], "state": _read_state(row[1])}
+        return {"id": instance_id, "workflow": row[0], "workflowVersion": row[2],
+                "state": _read_state(row[1])}
+
+    def migrate(self, instance_id: str, version: Any) -> dict[str, Any]:
+        """Re-pin a running instance to another existing version of the same workflow.
+
+        The target version must have the same number of steps with the same ordered
+        step names, and every step the instance has already entered (indexes
+        0..current) must be defined identically; only not-yet-entered steps may
+        differ in compensation/retry/await. The state itself is carried over
+        untouched — status, step, index, attempt, completed, compensated, context,
+        failure, waitingFor and deadlineAt all survive — and later advances run
+        against the target version. Rejections change nothing: no state write, no
+        ledger row, no audit record.
+        """
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise InvalidRequest("version must be a positive integer")
+        with self._lock:
+            row = self._db.execute(
+                "SELECT workflow, state, version FROM instances WHERE id = ?", (instance_id,)
+            ).fetchone()
+            if row is None:
+                raise InstanceNotFound(f"no instance {instance_id}")
+            name, raw_state, current_version = row
+            target = self.workflow(name, version)  # unknown version -> NotFound
+            state = _read_state(raw_state)
+            if state["status"] != "running":
+                raise InvalidTransition(f"instance is {state['status']}, not running")
+            if current_version is None:
+                raise InvalidTransition(
+                    "instance has no recorded workflow version; advance it once before migrating"
+                )
+            current = self.workflow(name, current_version)
+            self._check_compatible(current["steps"], target["steps"], int(state["index"]))
+            self._db.execute("UPDATE instances SET version = ? WHERE id = ?", (version, instance_id))
+            self._db.commit()
+        return {"id": instance_id, "workflow": name, "workflowVersion": version, "state": state}
+
+    @staticmethod
+    def _check_compatible(current_steps: list[dict[str, Any]], target_steps: list[dict[str, Any]],
+                          index: int) -> None:
+        if len(current_steps) != len(target_steps):
+            raise InvalidTransition("target version has a different number of steps")
+        for position, (current, target) in enumerate(zip(current_steps, target_steps)):
+            if current["name"] != target["name"]:
+                raise InvalidTransition(
+                    f"step {position} is {current['name']!r} in the current version "
+                    f"but {target['name']!r} in the target version"
+                )
+            if position <= index and current != target:
+                raise InvalidTransition(
+                    f"step {position} ({current['name']!r}) was already entered and its "
+                    "definition differs in the target version"
+                )
 
     def audit(self, instance_id: str) -> dict[str, Any]:
         """Read-only audit view: current state plus the accepted calls in commit order.
@@ -466,7 +613,7 @@ class Engine:
         simply have an empty (or short) history — nothing is fabricated.
         """
         with self._lock:
-            row = self._db.execute("SELECT workflow, state FROM instances WHERE id = ?", (instance_id,)).fetchone()
+            row = self._db.execute("SELECT workflow, state, version FROM instances WHERE id = ?", (instance_id,)).fetchone()
             if row is None:
                 raise InstanceNotFound(f"no instance {instance_id}")
             rows = self._db.execute(
@@ -479,7 +626,8 @@ class Engine:
              "request": json.loads(request), "response": json.loads(response)}
             for seq, kind, event_id, request, response in rows
         ]
-        return {"id": instance_id, "workflow": row[0], "state": _read_state(row[1]), "history": history}
+        return {"id": instance_id, "workflow": row[0], "workflowVersion": row[2],
+                "state": _read_state(row[1]), "history": history}
 
 
 def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
@@ -524,7 +672,9 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                 if parts == ["health"]:
                     return self._send(200, {"status": "ok"})
                 if parts == ["v1", "workflows"]:
-                    return self._send(200, {"workflows": sorted(engine._workflows)})
+                    return self._send(200, {"workflows": engine.workflow_names()})
+                if len(parts) == 3 and parts[:2] == ["v1", "workflows"]:
+                    return self._send(200, engine.workflow_info(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["v1", "instances"]:
                     return self._send(200, engine.get(parts[2]))
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "audit":
@@ -541,7 +691,8 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                 if len(parts) != 3 or parts[:2] != ["v1", "workflows"]:
                     return self._send(404, {"error": {"code": "not_found"}})
                 workflow = engine.define(parts[2], self._read_json())
-                return self._send(200, {"workflow": parts[2], "steps": workflow["steps"]})
+                return self._send(200, {"workflow": parts[2], "version": workflow["version"],
+                                        "steps": workflow["steps"]})
             except SagaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
             except Exception:
@@ -552,9 +703,14 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                 parts = self._parts()
                 if len(parts) == 4 and parts[:2] == ["v1", "workflows"] and parts[3] == "instances":
                     body = self._read_json() or {}
-                    if not isinstance(body, dict) or set(body) - {"context"}:
-                        raise InvalidRequest("body must be {\"context\": {...}} when present")
-                    return self._send(201, engine.start(parts[2], body.get("context")))
+                    if not isinstance(body, dict) or set(body) - {"context", "version"}:
+                        raise InvalidRequest('body must be {"context": {...}, "version": <int>} when present')
+                    return self._send(201, engine.start(parts[2], body.get("context"), body.get("version")))
+                if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "migrate":
+                    body = self._read_json()
+                    if not isinstance(body, dict) or set(body) - {"version"} or "version" not in body:
+                        raise InvalidRequest('body must be {"version": <positive integer>}')
+                    return self._send(200, engine.migrate(parts[2], body["version"]))
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "events":
                     body = self._read_json()
                     if not isinstance(body, dict) or set(body) - {"outcome", "detail", "eventId"}:

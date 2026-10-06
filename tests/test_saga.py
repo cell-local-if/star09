@@ -11,7 +11,7 @@ import unittest
 import urllib.error
 import urllib.request
 
-from saga import Engine, InstanceNotFound, InvalidRequest, InvalidTransition, SagaError, WORKFLOWS, apply_outcome, apply_signal, initial_state
+from saga import Engine, InstanceNotFound, InvalidRequest, InvalidTransition, NotFound, SagaError, WORKFLOWS, apply_outcome, apply_signal, initial_state
 
 
 class TransitionUnitTests(unittest.TestCase):
@@ -1798,6 +1798,368 @@ class TimeoutHttpTests(unittest.TestCase):
                                    {"outcome": "timed_out"})[0], 404)
         status, body = self.call("POST", f"/v1/instances/{iid}/events", {"outcome": "bogus"})
         self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+
+
+def _versioned_workflow() -> dict:
+    return {
+        "steps": [
+            {"name": "ask", "compensation": "cancel-ask", "await": {"event": "approved"}},
+            {"name": "do", "compensation": "undo-do"},
+            {"name": "ship", "compensation": "cancel-ship"},
+        ]
+    }
+
+
+class VersionDefinitionTests(unittest.TestCase):
+    """PUT appends immutable versions; definitions persist across reopen."""
+
+    def setUp(self) -> None:
+        fd, self.path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+
+    def tearDown(self) -> None:
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+    def test_builtins_seed_version_1_and_puts_append(self) -> None:
+        engine = Engine(self.path)
+        try:
+            self.assertEqual(engine.workflow_info("order")["version"], 1)
+            self.assertEqual(engine.workflow_info("order")["steps"], WORKFLOWS["order"]["steps"])
+            self.assertEqual(engine.workflow_info("provision")["version"], 1)
+            first = engine.define("order", {"steps": [{"name": "only"}]})
+            self.assertEqual(first["version"], 2)
+            second = engine.define("order", {"steps": [{"name": "x"}, {"name": "y"}]})
+            self.assertEqual(second["version"], 3)
+            # GET-style read returns the latest; pinned versions stay fetchable.
+            self.assertEqual(engine.workflow_info("order")["version"], 3)
+            self.assertEqual(engine.workflow("order", 1)["steps"], WORKFLOWS["order"]["steps"])
+            self.assertEqual(engine.workflow("order", 2)["steps"], [{"name": "only", "compensation": None}])
+            # A fresh name starts at version 1.
+            self.assertEqual(engine.define("custom", _versioned_workflow())["version"], 1)
+            self.assertIn("custom", engine.workflow_names())
+        finally:
+            engine.close()
+
+    def test_definitions_survive_reopen(self) -> None:
+        engine = Engine(self.path)
+        engine.define("custom", _versioned_workflow())
+        engine.define("custom", {"steps": [{"name": "ask"}, {"name": "do"}, {"name": "ship"}]})
+        engine.close()
+
+        engine = Engine(self.path)
+        try:
+            info = engine.workflow_info("custom")
+            self.assertEqual(info["version"], 2)
+            self.assertEqual([s["name"] for s in info["steps"]], ["ask", "do", "ship"])
+            self.assertEqual(engine.workflow("custom", 1)["steps"][0]["await"], {"event": "approved"})
+            self.assertEqual(engine.workflow_info("order")["version"], 1)
+            # The next PUT continues the sequence, it does not restart it.
+            self.assertEqual(engine.define("custom", _versioned_workflow())["version"], 3)
+        finally:
+            engine.close()
+
+    def test_invalid_put_appends_no_version(self) -> None:
+        engine = Engine(self.path)
+        try:
+            engine.define("w", {"steps": [{"name": "a"}]})
+            with self.assertRaises(InvalidRequest):
+                engine.define("w", {"steps": []})
+            self.assertEqual(engine.workflow_info("w")["version"], 1)
+        finally:
+            engine.close()
+
+    def test_unknown_workflow_and_unknown_version(self) -> None:
+        engine = Engine(self.path)
+        try:
+            with self.assertRaises(NotFound):
+                engine.workflow_info("nope")
+            with self.assertRaises(NotFound):
+                engine.workflow("order", 99)
+            with self.assertRaises(InvalidRequest):
+                engine.start("nope", {})
+            with self.assertRaises(NotFound):
+                engine.start("order", {}, version=99)
+            for bad in (0, -1, 1.5, "2", True):
+                with self.assertRaises(InvalidRequest, msg=repr(bad)):
+                    engine.start("order", {}, version=bad)
+        finally:
+            engine.close()
+
+
+class VersionPinningTests(unittest.TestCase):
+    """Instances pin the version they start on; PUTs do not affect them in flight."""
+
+    def setUp(self) -> None:
+        self.engine = Engine()
+        self.engine.define("flow", _versioned_workflow())
+
+    def tearDown(self) -> None:
+        self.engine.close()
+
+    def test_start_defaults_to_latest_and_response_carries_version(self) -> None:
+        started = self.engine.start("flow", {})
+        self.assertEqual(started["workflowVersion"], 1)
+        self.assertEqual(self.engine.get(started["id"])["workflowVersion"], 1)
+        self.assertEqual(self.engine.audit(started["id"])["workflowVersion"], 1)
+        self.engine.define("flow", {"steps": [{"name": "ask"}, {"name": "do"}, {"name": "ship"}]})
+        started2 = self.engine.start("flow", {})
+        self.assertEqual(started2["workflowVersion"], 2)
+
+    def test_start_with_explicit_version_pins_it(self) -> None:
+        self.engine.define("flow", {"steps": [{"name": "ask"}, {"name": "do"}, {"name": "ship"}]})
+        started = self.engine.start("flow", {}, version=1)
+        self.assertEqual(started["workflowVersion"], 1)
+        self.assertEqual(started["state"]["waitingFor"], "approved")  # v1 first step awaits
+
+    def test_later_put_does_not_change_in_flight_definition(self) -> None:
+        iid = self.engine.start("flow", {})["id"]
+        # v2 drops the await on step 0 and renames the compensations of steps 0/1.
+        self.engine.define("flow", {"steps": [
+            {"name": "ask", "compensation": "cancel-ask-v2"},
+            {"name": "do", "compensation": "undo-do-v2"},
+            {"name": "ship", "compensation": "abort-ship"},
+        ]})
+        # The pinned instance still waits on the v1 await.
+        self.assertEqual(self.engine.get(iid)["state"]["waitingFor"], "approved")
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded")
+        self.engine.signal(iid, "approved", event_id="s-1")
+        result = self.engine.advance(iid, "failed", event_id="e-1")
+        # Compensation names come from v1, not v2.
+        self.assertEqual(result["state"]["compensated"], ["undo-do", "cancel-ask"])
+        # Responses carry the pinned version, including ledger replays.
+        self.assertEqual(result["workflowVersion"], 1)
+        replay = self.engine.advance(iid, "failed", event_id="e-1")
+        self.assertEqual(replay, result)
+
+
+class VersionLegacyTests(unittest.TestCase):
+    """Instances persisted before versioning read as null and backfill on advance."""
+
+    def setUp(self) -> None:
+        fd, self.path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        legacy = sqlite3.connect(self.path)
+        legacy.execute("CREATE TABLE instances (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, state TEXT NOT NULL)")
+        state = initial_state(WORKFLOWS["order"], {})
+        legacy.execute("INSERT INTO instances VALUES (?, ?, ?)",
+                       ("legacy-id", "order", json.dumps(state)))
+        legacy.commit()
+        legacy.close()
+
+    def tearDown(self) -> None:
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+    def test_null_version_reads_back_and_backfills_on_first_advance(self) -> None:
+        engine = Engine(self.path)
+        try:
+            self.assertIsNone(engine.get("legacy-id")["workflowVersion"])
+            self.assertIsNone(engine.audit("legacy-id")["workflowVersion"])
+            # A rejected advance does not backfill anything.
+            engine.define("order", {"steps": [{"name": "reserve-stock"},
+                                              {"name": "charge-payment"},
+                                              {"name": "create-shipment"}]})
+            result = engine.advance("legacy-id", "succeeded", event_id="e-1")
+            self.assertEqual(result["workflowVersion"], 2)  # latest at advance time
+            self.assertEqual(engine.get("legacy-id")["workflowVersion"], 2)
+            self.assertEqual(engine.audit("legacy-id")["workflowVersion"], 2)
+            # And the instance is now pinned: a newer PUT does not move it.
+            engine.define("order", {"steps": [{"name": "only"}]})
+            self.assertEqual(engine.get("legacy-id")["workflowVersion"], 2)
+        finally:
+            engine.close()
+
+
+class MigrateEngineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = Engine()
+        self.engine.define("flow", _versioned_workflow())  # v1
+
+    def tearDown(self) -> None:
+        self.engine.close()
+
+    def _v2(self) -> None:
+        # Same ordered names; steps 0 and 1 identical; only the not-yet-entered
+        # step 2 changes (compensation renamed).
+        self.engine.define("flow", {"steps": [
+            {"name": "ask", "compensation": "cancel-ask", "await": {"event": "approved"}},
+            {"name": "do", "compensation": "undo-do"},
+            {"name": "ship", "compensation": "abort-ship"},
+        ]})
+
+    def test_migrate_preserves_state_and_switches_definition(self) -> None:
+        self._v2()
+        iid = self.engine.start("flow", {}, version=1)["id"]
+        self.engine.signal(iid, "approved", event_id="s-1")  # now at index 1 ("do")
+        before = self.engine.get(iid)["state"]
+        migrated = self.engine.migrate(iid, 2)
+        self.assertEqual(migrated["workflowVersion"], 2)
+        self.assertEqual(migrated["state"], before)  # every state field carried over
+        self.assertEqual(self.engine.get(iid)["workflowVersion"], 2)
+        # Advance onto the redefined step, then fail: compensation uses v2 names.
+        self.engine.advance(iid, "succeeded", event_id="e-1")
+        result = self.engine.advance(iid, "failed", event_id="e-2")
+        self.assertEqual(result["workflowVersion"], 2)
+        self.assertEqual(result["state"]["compensated"], ["abort-ship", "undo-do", "cancel-ask"])
+        # Historical responses keep the version they were recorded with.
+        history = self.engine.audit(iid)["history"]
+        self.assertEqual(history[0]["response"]["workflowVersion"], 1)
+        self.assertEqual([h["seq"] for h in history], [1, 2, 3])  # migrate appended nothing
+
+    def test_migrate_to_same_version_is_a_noop(self) -> None:
+        iid = self.engine.start("flow", {})["id"]
+        migrated = self.engine.migrate(iid, 1)
+        self.assertEqual(migrated["workflowVersion"], 1)
+
+    def test_migrate_rejections(self) -> None:
+        self._v2()
+        iid = self.engine.start("flow", {}, version=1)["id"]
+        # 400: missing / non-positive / non-integer versions.
+        for bad in (None, 0, -3, 1.5, "2", True):
+            with self.assertRaises(InvalidRequest, msg=repr(bad)):
+                self.engine.migrate(iid, bad)
+        # 404: unknown instance, unknown version.
+        with self.assertRaises(InstanceNotFound):
+            self.engine.migrate("missing", 2)
+        with self.assertRaises(NotFound):
+            self.engine.migrate(iid, 99)
+        # 409: terminal instance.
+        done = self.engine.start("flow", {}, version=1)["id"]
+        self.engine.signal(done, "approved")
+        self.engine.advance(done, "succeeded")
+        self.engine.advance(done, "succeeded")
+        with self.assertRaises(InvalidTransition):
+            self.engine.migrate(done, 2)
+        # Nothing changed for the rejected attempts.
+        self.assertEqual(self.engine.get(iid)["workflowVersion"], 1)
+        self.assertEqual(self.engine.audit(iid)["history"], [])
+
+    def test_migrate_incompatible_sequences_are_409(self) -> None:
+        iid = self.engine.start("flow", {}, version=1)["id"]
+        self.engine.signal(iid, "approved")  # index 1
+        # Different step count.
+        self.engine.define("flow", {"steps": [{"name": "ask"}, {"name": "do"}]})
+        with self.assertRaises(InvalidTransition):
+            self.engine.migrate(iid, 2)
+        # Same count, renamed step.
+        self.engine.define("flow", {"steps": [{"name": "ask"}, {"name": "do"}, {"name": "deliver"}]})
+        with self.assertRaises(InvalidTransition):
+            self.engine.migrate(iid, 3)
+        # Entered step (index 0, "ask") changed its await.
+        self.engine.define("flow", {"steps": [
+            {"name": "ask", "compensation": "cancel-ask", "await": {"event": "ok"}},
+            {"name": "do", "compensation": "undo-do"},
+            {"name": "ship", "compensation": "cancel-ship"},
+        ]})
+        with self.assertRaises(InvalidTransition):
+            self.engine.migrate(iid, 4)
+        # Current step (index 1, "do") changed compensation.
+        self.engine.define("flow", {"steps": [
+            {"name": "ask", "compensation": "cancel-ask", "await": {"event": "approved"}},
+            {"name": "do", "compensation": "undo-do-differently"},
+            {"name": "ship", "compensation": "cancel-ship"},
+        ]})
+        with self.assertRaises(InvalidTransition):
+            self.engine.migrate(iid, 5)
+        self.assertEqual(self.engine.get(iid)["workflowVersion"], 1)
+
+    def test_migrate_then_timeout_uses_target_version(self) -> None:
+        self.engine.define("flow", {"steps": [
+            {"name": "ask", "compensation": "cancel-ask", "await": {"event": "approved"}},
+            {"name": "do", "compensation": "undo-do"},
+            {"name": "ship", "compensation": "cancel-ship",
+             "await": {"event": "shipped", "timeoutMs": 1}},
+        ]})
+        iid = self.engine.start("flow", {}, version=1)["id"]
+        self.engine.signal(iid, "approved")  # index 1 ("do"); ship not yet entered
+        self.engine.migrate(iid, 2)
+        # Advancing now enters v2's awaiting ship step with its timeout.
+        result = self.engine.advance(iid, "succeeded", event_id="e-1")
+        self.assertEqual(result["state"]["waitingFor"], "shipped")
+        self.assertIsInstance(result["state"]["deadlineAt"], int)
+        time.sleep(0.02)
+        dead = self.engine.advance(iid, "timed_out", event_id="t-1")
+        self.assertEqual(dead["state"]["status"], "dead_lettered")
+        self.assertEqual(dead["state"]["failure"]["step"], "ship")
+
+
+class VersionHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from saga import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def call(self, method: str, path: str, body: dict | None = None):
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def test_workflow_get_and_versioned_start(self) -> None:
+        status, body = self.call("GET", "/v1/workflows/order")
+        self.assertEqual((status, body["version"]), (200, 1))
+        self.assertEqual(body["workflow"], "order")
+        self.assertEqual(len(body["steps"]), 3)
+        self.assertEqual(self.call("GET", "/v1/workflows/nope")[0], 404)
+        status, body = self.call("PUT", "/v1/workflows/vflow", {"steps": [{"name": "a"}]})
+        self.assertEqual((status, body["version"]), (200, 1))
+        status, body = self.call("PUT", "/v1/workflows/vflow", {"steps": [{"name": "b"}]})
+        self.assertEqual(body["version"], 2)
+        status, body = self.call("GET", "/v1/workflows/vflow")
+        self.assertEqual((body["version"], body["steps"][0]["name"]), (2, "b"))
+        # Start pinned to v1 vs. latest.
+        status, body = self.call("POST", "/v1/workflows/vflow/instances", {"version": 1})
+        self.assertEqual(status, 201)
+        self.assertEqual((body["workflowVersion"], body["state"]["step"]), (1, "a"))
+        status, body = self.call("POST", "/v1/workflows/vflow/instances", {})
+        self.assertEqual((body["workflowVersion"], body["state"]["step"]), (2, "b"))
+        self.assertEqual(self.call("GET", f"/v1/instances/{body['id']}")[1]["workflowVersion"], 2)
+        # Bad version shapes on start.
+        self.assertEqual(self.call("POST", "/v1/workflows/vflow/instances", {"version": 0})[0], 400)
+        self.assertEqual(self.call("POST", "/v1/workflows/vflow/instances", {"version": 9})[0], 404)
+        self.assertEqual(self.call("POST", "/v1/workflows/vflow/instances", {"version": 1, "x": 1})[0], 400)
+
+    def test_migrate_endpoint(self) -> None:
+        self.call("PUT", "/v1/workflows/mflow", {"steps": [
+            {"name": "s1", "compensation": "c1"},
+            {"name": "s2", "compensation": "c2"},
+        ]})
+        self.call("PUT", "/v1/workflows/mflow", {"steps": [
+            {"name": "s1", "compensation": "c1"},
+            {"name": "s2", "compensation": "c2-new"},
+        ]})
+        iid = self.call("POST", "/v1/workflows/mflow/instances", {"version": 1})[1]["id"]
+        # Malformed bodies.
+        for bad_body, expected in ((None, 400), ({}, 400), ({"version": 0}, 400),
+                                   ({"version": "2"}, 400), ({"version": 2, "x": 1}, 400),
+                                   ({"version": 99}, 404)):
+            status, body = self.call("POST", f"/v1/instances/{iid}/migrate", bad_body)
+            self.assertEqual(status, expected, bad_body)
+        self.assertEqual(self.call("POST", "/v1/instances/missing/migrate", {"version": 2})[0], 404)
+        # Happy path: state untouched, version switched, v2 compensation applies.
+        status, body = self.call("POST", f"/v1/instances/{iid}/migrate", {"version": 2})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["workflowVersion"], 2)
+        self.assertEqual((body["state"]["status"], body["state"]["step"]), ("running", "s1"))
+        self.call("POST", f"/v1/instances/{iid}/events", {"outcome": "succeeded"})
+        status, body = self.call("POST", f"/v1/instances/{iid}/events", {"outcome": "failed"})
+        self.assertEqual(body["state"]["compensated"], ["c2-new", "c1"])
+        self.assertEqual(body["workflowVersion"], 2)
+        # Terminal instances cannot migrate.
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/migrate", {"version": 1})[0], 409)
 
 
 if __name__ == "__main__":
