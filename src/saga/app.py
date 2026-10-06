@@ -52,6 +52,49 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
 _UNSET = object()
 
 
+class _RevisionedResponse(dict):
+    """A response dict carrying the instance revision it reflects, for ETag emission.
+
+    It is a plain ``dict`` as far as JSON serialization and equality are concerned
+    (so stored/replayed responses compare exactly as before); ``revision`` is extra
+    metadata captured in the same locked transaction as the body, never read in a
+    separate query afterwards.
+    """
+
+    __slots__ = ("revision",)
+
+    def __init__(self, mapping: dict[str, Any], revision: int) -> None:
+        super().__init__(mapping)
+        self.revision = revision
+
+# If-Match is optional on mutating calls. None means the header was omitted, in
+# which case no precondition is added at all; an int is the revision the client
+# last observed. Header *syntax* is the HTTP layer's job (parse_if_match).
+
+
+def parse_if_match(raw: str | None) -> int | None:
+    """Parse an optional If-Match header carrying exactly one quoted revision.
+
+    The only accepted shape is a single double-quoted non-negative decimal,
+    e.g. ``"1"`` — matching the ETag form emitted on instance responses. Empty
+    values, multiple values, weak tags (``W/"1"``), the wildcard ``*`` and
+    unquoted numbers are all ``400 invalid_request``. ``None`` (header absent)
+    returns ``None``: the call carries no precondition.
+    """
+    if raw is None:
+        return None
+    if len(raw) < 2 or not (raw.startswith('"') and raw.endswith('"')):
+        raise InvalidRequest("If-Match must be a single quoted instance version, e.g. \"1\"")
+    digits = raw[1:-1]
+    if not digits or not digits.isascii() or not digits.isdigit():
+        raise InvalidRequest("If-Match must quote a decimal version")
+    # Canonical decimal only: "01" is not a valid version literal (only "0" may
+    # start with 0, and it can never match a revision since those start at 1).
+    if len(digits) > 1 and digits[0] == "0":
+        raise InvalidRequest("If-Match version must not have leading zeros")
+    return int(digits)
+
+
 def validate_workflow(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise InvalidRequest("body must be a JSON object")
@@ -286,6 +329,13 @@ class Engine:
         columns = {row[1] for row in self._db.execute("PRAGMA table_info(instances)")}
         if "version" not in columns:
             self._db.execute("ALTER TABLE instances ADD COLUMN version INTEGER")
+        # Optimistic concurrency: every instance starts at revision 1 and the
+        # revision advances by one only on a change that really mutates the
+        # instance. Files created before concurrency control lack the column; it
+        # is added with NULL, which reads back as revision 1 and becomes 2 on the
+        # instance's first real change — no historical change count is fabricated.
+        if "instance_version" not in columns:
+            self._db.execute("ALTER TABLE instances ADD COLUMN instance_version INTEGER")
         # Immutable workflow definitions: one row per (name, version), never updated
         # or deleted, so a pinned instance always finds the exact definition it
         # started with — including after the process reopens the same file.
@@ -415,13 +465,17 @@ class Engine:
             instance_id = str(uuid.uuid4())
             state = initial_state(workflow, context or {})
             self._db.execute(
-                "INSERT INTO instances (id, workflow, state, version) VALUES (?, ?, ?, ?)",
+                "INSERT INTO instances (id, workflow, state, version, instance_version) "
+                "VALUES (?, ?, ?, ?, 1)",
                 (instance_id, name, json.dumps(state), version),
             )
             self._db.commit()
-        return {"id": instance_id, "workflow": name, "workflowVersion": version, "state": state}
+        return _RevisionedResponse(
+            {"id": instance_id, "workflow": name, "workflowVersion": version, "state": state}, 1
+        )
 
-    def advance(self, instance_id: str, outcome: Any, detail: Any = None, event_id: Any = _UNSET) -> dict[str, Any]:
+    def advance(self, instance_id: str, outcome: Any, detail: Any = None, event_id: Any = _UNSET,
+                if_match: int | None = None) -> dict[str, Any]:
         """Apply one outcome event atomically.
 
         Without event_id the behavior is the baseline: every call re-enters the state
@@ -431,6 +485,11 @@ class Engine:
         without touching the instance state; a repeat whose outcome/detail differs
         raises InvalidTransition. Nothing is written to the ledger unless the transition
         succeeds.
+
+        With ``if_match`` set, the call proceeds only when the instance's current
+        revision equals it; a stale observation raises InvalidTransition. The
+        idempotency replay is checked first: a repeat of an already-accepted
+        eventId returns the first response even when the revision has moved on.
         """
         if event_id is _UNSET:
             # Anonymous call: no ledger, but the audit trail still records the
@@ -441,14 +500,17 @@ class Engine:
             normalized = self._normalize_request(event_id, {"outcome": outcome, "detail": detail},
                                                  ("eventId", "outcome", "detail"))
         return self._commit(instance_id, "instance_events", "event", normalized,
-                            lambda workflow, state: apply_outcome(workflow, state, outcome, detail))
+                            lambda workflow, state: apply_outcome(workflow, state, outcome, detail),
+                            if_match)
 
-    def signal(self, instance_id: str, event: Any, detail: Any = None, event_id: Any = _UNSET) -> dict[str, Any]:
+    def signal(self, instance_id: str, event: Any, detail: Any = None, event_id: Any = _UNSET,
+               if_match: int | None = None) -> dict[str, Any]:
         """Deliver an external signal to a waiting instance, with eventId semantics
         identical to :meth:`advance` (instance-scoped, full-response replay).
 
         Rejections (bad request, unknown instance, not waiting / mismatched event)
-        write no ledger rows.
+        write no ledger rows. An optional ``if_match`` revision precondition works
+        exactly as on :meth:`advance`, and replay still takes precedence over it.
         """
         if not isinstance(event, str) or not event or len(event) > 100:
             raise InvalidRequest("event must be a non-empty string of at most 100 characters")
@@ -459,23 +521,31 @@ class Engine:
             normalized = self._normalize_request(event_id, {"event": event, "detail": detail},
                                                  ("eventId", "event", "detail"))
         return self._commit(instance_id, "instance_signals", "signal", normalized,
-                            lambda workflow, state: apply_signal(workflow, state, event, detail))
+                            lambda workflow, state: apply_signal(workflow, state, event, detail),
+                            if_match)
 
     def _commit(self, instance_id: str, table: str, kind: str, normalized: dict[str, Any],
-                transition: Any) -> dict[str, Any]:
+                transition: Any, if_match: int | None = None) -> dict[str, Any]:
         """Shared idempotent commit for outcome events and signals.
 
-        Lookup, ledger replay, state transition, ledger insert and audit append happen
-        under one lock and in one transaction; the ledger primary key makes a racing
-        duplicate insert fail even if the lock were ever bypassed. Only a call that
-        actually advances the state machine appends an audit row: replays return
-        before the transition and rejections raise before any write.
+        Lookup, ledger replay, precondition check, state transition, revision
+        bump, ledger insert and audit append happen under one lock and in one
+        transaction; the ledger primary key makes a racing duplicate insert fail
+        even if the lock were ever bypassed. Only a call that actually advances
+        the state machine appends an audit row and increments the revision:
+        replays return before the transition and rejections raise before any
+        write. A replay is resolved *before* the If-Match precondition, so a
+        resubmitted accepted eventId replays verbatim on a stale revision.
         """
         event_id = normalized["eventId"]
         with self._lock:
-            row = self._db.execute("SELECT workflow, state, version FROM instances WHERE id = ?", (instance_id,)).fetchone()
+            row = self._db.execute(
+                "SELECT workflow, state, version, instance_version FROM instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
             if row is None:
                 raise InstanceNotFound(f"no instance {instance_id}")
+            revision = row[3] if row[3] is not None else 1
             if event_id is not None:
                 ledger = self._db.execute(
                     f"SELECT request, response FROM {table} WHERE instance_id = ? AND event_id = ?",
@@ -488,7 +558,16 @@ class Engine:
                         raise InvalidTransition(
                             f"{kind_label} {event_id!r} was already submitted for this instance with a different payload"
                         )
-                    return json.loads(stored_response)
+                    # Replay beats the precondition: the first response is handed
+                    # back verbatim on whatever revision the instance is now at.
+                    return _RevisionedResponse(json.loads(stored_response), revision)
+            # No ledger replay: an explicit precondition must match the current
+            # revision before the state machine is entered. A rejected
+            # precondition writes nothing (no state, no ledger, no audit).
+            if if_match is not None and if_match != revision:
+                raise InvalidTransition(
+                    f"instance version is {revision}, not {if_match}"
+                )
             # The instance advances against the definition of its pinned version, so a
             # later PUT of the same name never affects in-flight instances. Instances
             # persisted before versioning existed (version NULL) resolve the latest
@@ -502,8 +581,14 @@ class Engine:
             state = _read_state(row[1])
             state = transition(workflow, state)
             response = {"id": instance_id, "workflow": row[0], "workflowVersion": version, "state": state}
-            self._db.execute("UPDATE instances SET state = ?, version = ? WHERE id = ?",
-                             (json.dumps(state), version, instance_id))
+            # The transition was accepted: the instance really changed, so the
+            # revision advances by exactly one (a NULL legacy revision becomes 2
+            # after its first post-upgrade change, never 1 — it read as 1).
+            next_revision = revision + 1
+            self._db.execute(
+                "UPDATE instances SET state = ?, version = ?, instance_version = ? WHERE id = ?",
+                (json.dumps(state), version, next_revision, instance_id),
+            )
             if event_id is not None:
                 self._db.execute(
                     f"INSERT INTO {table} (instance_id, event_id, request, response) VALUES (?, ?, ?, ?)",
@@ -520,7 +605,7 @@ class Engine:
                  json.dumps(response), instance_id),
             )
             self._db.commit()
-        return response
+        return _RevisionedResponse(response, next_revision)
 
     @staticmethod
     def _normalize_request(event_id: Any, payload: dict[str, Any], key_order: tuple[str, ...],
@@ -547,13 +632,20 @@ class Engine:
 
     def get(self, instance_id: str) -> dict[str, Any]:
         with self._lock:
-            row = self._db.execute("SELECT workflow, state, version FROM instances WHERE id = ?", (instance_id,)).fetchone()
+            row = self._db.execute(
+                "SELECT workflow, state, version, instance_version FROM instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
         if row is None:
             raise InstanceNotFound(f"no instance {instance_id}")
-        return {"id": instance_id, "workflow": row[0], "workflowVersion": row[2],
-                "state": _read_state(row[1])}
+        revision = row[3] if row[3] is not None else 1
+        return _RevisionedResponse(
+            {"id": instance_id, "workflow": row[0], "workflowVersion": row[2],
+             "state": _read_state(row[1])},
+            revision,
+        )
 
-    def migrate(self, instance_id: str, version: Any) -> dict[str, Any]:
+    def migrate(self, instance_id: str, version: Any, if_match: int | None = None) -> dict[str, Any]:
         """Re-pin a running instance to another existing version of the same workflow.
 
         The target version must have the same number of steps with the same ordered
@@ -563,17 +655,24 @@ class Engine:
         untouched — status, step, index, attempt, completed, compensated, context,
         failure, waitingFor and deadlineAt all survive — and later advances run
         against the target version. Rejections change nothing: no state write, no
-        ledger row, no audit record.
+        ledger row, no audit record, no revision bump. A successful migration is a
+        real instance change, so the revision advances by one even when the state
+        body is carried over field for field. An optional ``if_match`` precondition
+        works exactly as on :meth:`advance`.
         """
         if isinstance(version, bool) or not isinstance(version, int) or version < 1:
             raise InvalidRequest("version must be a positive integer")
         with self._lock:
             row = self._db.execute(
-                "SELECT workflow, state, version FROM instances WHERE id = ?", (instance_id,)
+                "SELECT workflow, state, version, instance_version FROM instances WHERE id = ?",
+                (instance_id,),
             ).fetchone()
             if row is None:
                 raise InstanceNotFound(f"no instance {instance_id}")
-            name, raw_state, current_version = row
+            name, raw_state, current_version, raw_revision = row
+            revision = raw_revision if raw_revision is not None else 1
+            if if_match is not None and if_match != revision:
+                raise InvalidTransition(f"instance version is {revision}, not {if_match}")
             target = self.workflow(name, version)  # unknown version -> NotFound
             state = _read_state(raw_state)
             if state["status"] != "running":
@@ -584,9 +683,16 @@ class Engine:
                 )
             current = self.workflow(name, current_version)
             self._check_compatible(current["steps"], target["steps"], int(state["index"]))
-            self._db.execute("UPDATE instances SET version = ? WHERE id = ?", (version, instance_id))
+            next_revision = revision + 1
+            self._db.execute(
+                "UPDATE instances SET version = ?, instance_version = ? WHERE id = ?",
+                (version, next_revision, instance_id),
+            )
             self._db.commit()
-        return {"id": instance_id, "workflow": name, "workflowVersion": version, "state": state}
+        return _RevisionedResponse(
+            {"id": instance_id, "workflow": name, "workflowVersion": version, "state": state},
+            next_revision,
+        )
 
     @staticmethod
     def _check_compatible(current_steps: list[dict[str, Any]], target_steps: list[dict[str, Any]],
@@ -613,7 +719,10 @@ class Engine:
         simply have an empty (or short) history — nothing is fabricated.
         """
         with self._lock:
-            row = self._db.execute("SELECT workflow, state, version FROM instances WHERE id = ?", (instance_id,)).fetchone()
+            row = self._db.execute(
+                "SELECT workflow, state, version, instance_version FROM instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
             if row is None:
                 raise InstanceNotFound(f"no instance {instance_id}")
             rows = self._db.execute(
@@ -626,8 +735,12 @@ class Engine:
              "request": json.loads(request), "response": json.loads(response)}
             for seq, kind, event_id, request, response in rows
         ]
-        return {"id": instance_id, "workflow": row[0], "workflowVersion": row[2],
-                "state": _read_state(row[1]), "history": history}
+        revision = row[3] if row[3] is not None else 1
+        return _RevisionedResponse(
+            {"id": instance_id, "workflow": row[0], "workflowVersion": row[2],
+             "state": _read_state(row[1]), "history": history},
+            revision,
+        )
 
 
 def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
@@ -642,6 +755,11 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
             raw = json.dumps(body).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
+            # Instance-carrying responses expose their revision as a quoted
+            # decimal ETag (e.g. ETag: "2"); other responses send none.
+            revision = getattr(body, "revision", None)
+            if isinstance(revision, int):
+                self.send_header("ETag", f'"{revision}"')
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
@@ -708,21 +826,25 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                     return self._send(201, engine.start(parts[2], body.get("context"), body.get("version")))
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "migrate":
                     body = self._read_json()
+                    if_match = parse_if_match(self.headers.get("If-Match"))
                     if not isinstance(body, dict) or set(body) - {"version"} or "version" not in body:
                         raise InvalidRequest('body must be {"version": <positive integer>}')
-                    return self._send(200, engine.migrate(parts[2], body["version"]))
+                    return self._send(200, engine.migrate(parts[2], body["version"], if_match))
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "events":
                     body = self._read_json()
+                    if_match = parse_if_match(self.headers.get("If-Match"))
                     if not isinstance(body, dict) or set(body) - {"outcome", "detail", "eventId"}:
                         raise InvalidRequest(
                             'body must be {"outcome": "succeeded|failed|timed_out", "detail": ..., "eventId": "..."}'
                         )
                     event_id = body["eventId"] if "eventId" in body else _UNSET
                     return self._send(
-                        200, engine.advance(parts[2], body.get("outcome"), body.get("detail"), event_id)
+                        200, engine.advance(parts[2], body.get("outcome"), body.get("detail"),
+                                            event_id, if_match)
                     )
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "signals":
                     body = self._read_json()
+                    if_match = parse_if_match(self.headers.get("If-Match"))
                     if not isinstance(body, dict) or set(body) - {"event", "detail", "eventId"}:
                         raise InvalidRequest(
                             'body must be {"event": "<name>", "detail": ..., "eventId": "..."}'
@@ -731,7 +853,8 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                         raise InvalidRequest('body must be {"event": "<name>", ...}')
                     event_id = body["eventId"] if "eventId" in body else _UNSET
                     return self._send(
-                        200, engine.signal(parts[2], body.get("event"), body.get("detail"), event_id)
+                        200, engine.signal(parts[2], body.get("event"), body.get("detail"),
+                                           event_id, if_match)
                     )
                 return self._send(404, {"error": {"code": "not_found"}})
             except SagaError as error:

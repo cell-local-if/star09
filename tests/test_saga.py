@@ -11,7 +11,7 @@ import unittest
 import urllib.error
 import urllib.request
 
-from saga import Engine, InstanceNotFound, InvalidRequest, InvalidTransition, NotFound, SagaError, WORKFLOWS, apply_outcome, apply_signal, initial_state
+from saga import Engine, InstanceNotFound, InvalidRequest, InvalidTransition, NotFound, SagaError, WORKFLOWS, apply_outcome, apply_signal, initial_state, parse_if_match
 
 
 class TransitionUnitTests(unittest.TestCase):
@@ -2160,6 +2160,511 @@ class VersionHttpTests(unittest.TestCase):
         self.assertEqual(body["workflowVersion"], 2)
         # Terminal instances cannot migrate.
         self.assertEqual(self.call("POST", f"/v1/instances/{iid}/migrate", {"version": 1})[0], 409)
+
+
+class IfMatchParsingTests(unittest.TestCase):
+    """The only accepted If-Match shape is one double-quoted decimal version."""
+
+    def test_absent_header_means_no_precondition(self) -> None:
+        self.assertIsNone(parse_if_match(None))
+
+    def test_quoted_decimals_parse(self) -> None:
+        self.assertEqual(parse_if_match('"1"'), 1)
+        self.assertEqual(parse_if_match('"0"'), 0)
+        self.assertEqual(parse_if_match('"42"'), 42)
+        self.assertEqual(parse_if_match('"1000000000"'), 1_000_000_000)
+
+    def test_malformed_values_are_400(self) -> None:
+        bad = [
+            "",                # empty
+            '"',               # lone quote
+            '""',              # empty quoted string
+            "1",               # unquoted number
+            "-1",              # unquoted negative
+            " 1 ",             # unquoted with whitespace
+            'W/"1"',           # weak validator, uppercase
+            'w/"1"',           # weak validator, lowercase
+            "W/\"1\"",
+            "*",               # wildcard
+            '"*"',             # quoted wildcard
+            '"1", "2"',        # multiple values
+            '"1","2"',         # multiple values, no space
+            '"1",*',           # value plus wildcard
+            '" 1"',            # leading whitespace inside quotes
+            '"1 "',            # trailing whitespace inside quotes
+            '"-1"',            # quoted negative
+            '"1.0"',           # decimal point
+            '"01"',            # leading zero
+            '"00"',            # leading zeros
+            '"0x1"',           # hex
+            '"1\\u0032"',      # escape, not raw digits
+            '"abc"',           # non-numeric
+            '"1" ',            # trailing data after the closing quote
+            ' "*"',            # whitespace then wildcard
+        ]
+        for raw in bad:
+            with self.assertRaises(InvalidRequest, msg=repr(raw)):
+                parse_if_match(raw)
+
+
+def _await2_workflow() -> dict:
+    return {"steps": [
+        {"name": "ask", "compensation": "cancel-ask", "await": {"event": "approved", "timeoutMs": 5000}},
+        {"name": "do", "compensation": "undo-do"},
+    ]}
+
+
+class InstanceRevisionEngineTests(unittest.TestCase):
+    """Instance-level revision: starts at 1, bumps only on real change."""
+
+    def setUp(self) -> None:
+        self.engine = Engine()
+        self.engine.define("approval", _await2_workflow())
+
+    def tearDown(self) -> None:
+        self.engine.close()
+
+    def _start(self, workflow: str = "order") -> str:
+        started = self.engine.start(workflow, {})
+        self.assertEqual(started.revision, 1)  # every instance starts at revision 1
+        return started["id"]
+
+    def test_revision_bumps_on_accepted_events_and_signals(self) -> None:
+        iid = self._start("approval")
+        self.assertEqual(self.engine.get(iid).revision, 1)
+        first = self.engine.signal(iid, "approved", event_id="s-1")
+        self.assertEqual(first.revision, 2)
+        self.assertEqual(self.engine.get(iid).revision, 2)
+        second = self.engine.advance(iid, "succeeded", event_id="e-1")
+        self.assertEqual(second.revision, 3)
+        self.assertEqual(self.engine.get(iid).revision, 3)
+        # Audit view reports the same current revision.
+        self.assertEqual(self.engine.audit(iid).revision, 3)
+
+    def test_retryable_failure_bumps_once(self) -> None:
+        self.engine.define("retryable", {"steps": [
+            {"name": "a", "compensation": "undo-a", "retry": {"maxAttempts": 2}}]})
+        iid = self.engine.start("retryable", {})["id"]
+        result = self.engine.advance(iid, "failed", {"why": 1}, event_id="e-1")
+        self.assertEqual(result["state"]["attempt"], 2)
+        self.assertEqual(result.revision, 2)
+        self.assertEqual(self.engine.get(iid).revision, 2)
+
+    def test_rejected_calls_do_not_bump_revision(self) -> None:
+        iid = self._start("approval")  # waiting for approved, revision 1
+        # Illegal outcome.
+        with self.assertRaises(InvalidRequest):
+            self.engine.advance(iid, "bogus", event_id="e-bad")
+        # Ordinary result while waiting.
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-wait")
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "failed", event_id="e-wait2")
+        # Mismatched signal name.
+        with self.assertRaises(InvalidTransition):
+            self.engine.signal(iid, "rejected", event_id="s-x")
+        # timed_out before its deadline.
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "timed_out", event_id="t-early")
+        self.assertEqual(self.engine.get(iid).revision, 1)
+        # Accept the signal, then terminal-state pushes and late signals stay flat.
+        self.engine.signal(iid, "approved", event_id="s-1")  # -> 2
+        self.engine.advance(iid, "succeeded", event_id="e-1")  # completed -> 3
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-after")
+        with self.assertRaises(InvalidTransition):
+            self.engine.signal(iid, "approved", event_id="s-after")
+        self.assertEqual(self.engine.get(iid).revision, 3)
+        self.assertEqual([h["seq"] for h in self.engine.audit(iid)["history"]], [1, 2])
+
+    def test_accepted_timed_out_bumps_revision(self) -> None:
+        self.engine.define("expiring", {"steps": [
+            {"name": "ask", "await": {"event": "approved", "timeoutMs": 1}}]})
+        iid = self.engine.start("expiring", {})["id"]
+        time.sleep(0.02)
+        dead = self.engine.advance(iid, "timed_out", {"why": "late"}, event_id="t-1")
+        self.assertEqual(dead["state"]["status"], "dead_lettered")
+        self.assertEqual(dead.revision, 2)
+        self.assertEqual(self.engine.get(iid).revision, 2)
+
+    def test_matching_if_match_proceeds(self) -> None:
+        iid = self._start()
+        result = self.engine.advance(iid, "succeeded", event_id="e-1", if_match=1)
+        self.assertEqual(result.revision, 2)
+        result = self.engine.advance(iid, "succeeded", event_id="e-2", if_match=2)
+        self.assertEqual(result.revision, 3)
+
+    def test_stale_if_match_is_409_and_changes_nothing(self) -> None:
+        iid = self._start()
+        self.engine.advance(iid, "succeeded", event_id="e-1")  # revision now 2
+        snapshot = self.engine.get(iid)
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-2", if_match=1)
+        with self.assertRaises(InvalidTransition):
+            self.engine.signal(iid, "approved", event_id="s-x", if_match=1)
+        # State, revision, ledger and audit are all untouched.
+        current = self.engine.get(iid)
+        self.assertEqual(current["state"], snapshot["state"])
+        self.assertEqual(current.revision, 2)
+        audit = self.engine.audit(iid)
+        self.assertEqual([h["eventId"] for h in audit["history"]], ["e-1"])
+        self.assertEqual(
+            self.engine._db.execute(
+                "SELECT event_id FROM instance_events WHERE instance_id = ? ORDER BY event_id", (iid,)
+            ).fetchall(),
+            [("e-1",)],
+        )
+
+    def test_if_match_equal_but_illegal_transition_still_409_without_bump(self) -> None:
+        iid = self._start()
+        with self.assertRaises(InvalidRequest):
+            self.engine.advance(iid, "bogus", event_id="e-bad", if_match=1)
+        self.engine.advance(iid, "failed", event_id="e-fin")  # compensated -> 2
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-x", if_match=2)
+        self.assertEqual(self.engine.get(iid).revision, 2)
+
+    def test_unknown_instance_is_404_even_with_if_match(self) -> None:
+        with self.assertRaises(InstanceNotFound):
+            self.engine.advance("missing", "succeeded", event_id="e-1", if_match=1)
+        with self.assertRaises(InstanceNotFound):
+            self.engine.migrate("missing", 1, if_match=1)
+
+    def test_replay_precedes_if_match_even_on_stale_revision(self) -> None:
+        iid = self._start()
+        first = self.engine.advance(iid, "succeeded", {"note": "first"}, event_id="e-1")  # -> 2
+        self.engine.advance(iid, "succeeded", event_id="e-2")  # -> 3
+        # Stale precondition, but the eventId is a replay: first response verbatim.
+        replay = self.engine.advance(iid, "succeeded", {"note": "first"}, event_id="e-1", if_match=1)
+        self.assertEqual(replay, first)
+        self.assertEqual(replay["state"]["index"], 1)  # historical state
+        # The replay envelope reports the *current* revision for its ETag.
+        self.assertEqual(replay.revision, 3)
+        self.assertEqual(self.engine.get(iid).revision, 3)
+        self.assertEqual(len(self.engine.audit(iid)["history"]), 2)
+
+    def test_replay_different_payload_is_409_regardless_of_if_match(self) -> None:
+        iid = self._start()
+        self.engine.advance(iid, "succeeded", event_id="e-1")  # -> 2
+        # Matching precondition cannot rescue a conflicting replay.
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "failed", event_id="e-1", if_match=2)
+        # Stale precondition and conflicting payload: still the idempotency 409.
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "failed", event_id="e-1", if_match=1)
+        self.assertEqual(self.engine.get(iid).revision, 2)
+        self.assertEqual(len(self.engine.audit(iid)["history"]), 1)
+
+    def test_signal_replay_precedes_if_match(self) -> None:
+        iid = self._start("approval")
+        first = self.engine.signal(iid, "approved", {"by": "boss"}, event_id="s-1")  # -> 2
+        replay = self.engine.signal(iid, "approved", {"by": "boss"}, event_id="s-1", if_match=1)
+        self.assertEqual(replay, first)
+        self.assertEqual(replay.revision, 2)
+        self.assertEqual(self.engine.get(iid).revision, 2)
+
+    def test_migrate_bumps_revision_and_preserves_state_field_by_field(self) -> None:
+        # v2 keeps the entered step 0 identical and only reworks the not-yet-entered
+        # step 1's compensation, so the migration is compatible.
+        self.engine.define("approval", {"steps": [
+            {"name": "ask", "compensation": "cancel-ask", "await": {"event": "approved", "timeoutMs": 5000}},
+            {"name": "do", "compensation": "undo-do-v2"},
+        ]})
+        iid = self.engine.start("approval", {}, version=1)["id"]
+        before = self.engine.get(iid)["state"]
+        migrated = self.engine.migrate(iid, 2)
+        self.assertEqual(migrated["workflowVersion"], 2)
+        self.assertEqual(migrated["state"], before)  # every state field carried over
+        self.assertEqual(migrated.revision, 2)
+        self.assertEqual(self.engine.get(iid).revision, 2)
+        self.assertEqual(self.engine.get(iid)["state"], before)
+        # Advancing after the migration uses v2's definitions.
+        self.engine.signal(iid, "approved", event_id="s-1")  # enters "do" -> 3
+        failed = self.engine.advance(iid, "failed", event_id="e-1")  # -> 4
+        self.assertEqual(failed["state"]["compensated"], ["undo-do-v2", "cancel-ask"])
+        # Migration wrote neither ledger rows nor audit records.
+        self.assertEqual([h["seq"] for h in self.engine.audit(iid)["history"]], [1, 2])
+        self.assertEqual(self.engine.get(iid).revision, 4)
+
+    def test_migrate_with_if_match(self) -> None:
+        self.engine.define("approval", {"steps": [
+            {"name": "ask", "compensation": "cancel-ask", "await": {"event": "approved", "timeoutMs": 5000}},
+            {"name": "do", "compensation": "undo-do-v2"},
+        ]})
+        iid = self.engine.start("approval", {}, version=1)["id"]
+        self.assertEqual(self.engine.migrate(iid, 2, if_match=1).revision, 2)
+        # A second migration pinned to the old observation is rejected, changes nothing.
+        self.engine.define("approval", {"steps": [
+            {"name": "ask", "compensation": "cancel-ask", "await": {"event": "approved", "timeoutMs": 5000}},
+            {"name": "do", "compensation": "undo-do-v3"},
+        ]})
+        with self.assertRaises(InvalidTransition):
+            self.engine.migrate(iid, 3, if_match=1)
+        self.assertEqual(self.engine.get(iid)["workflowVersion"], 2)
+        self.assertEqual(self.engine.get(iid).revision, 2)
+        # The current observation migrates fine.
+        self.assertEqual(self.engine.migrate(iid, 3, if_match=2).revision, 3)
+
+    def test_incompatible_migrate_does_not_bump(self) -> None:
+        self.engine.define("approval", {"steps": [{"name": "ask"}]})  # different step count
+        iid = self.engine.start("approval", {}, version=1)["id"]
+        with self.assertRaises(InvalidTransition):
+            self.engine.migrate(iid, 2, if_match=1)
+        self.assertEqual(self.engine.get(iid).revision, 1)
+        self.assertEqual(self.engine.get(iid)["workflowVersion"], 1)
+
+    def test_concurrent_stale_preconditions_one_winner(self) -> None:
+        iid = self._start()
+        barrier = threading.Barrier(2)
+        outcomes: list[str] = []
+        lock = threading.Lock()
+
+        def submit(event_id: str) -> None:
+            try:
+                barrier.wait()
+                self.engine.advance(iid, "succeeded", event_id=event_id, if_match=1)
+                with lock:
+                    outcomes.append("ok")
+            except InvalidTransition:
+                with lock:
+                    outcomes.append("conflict")
+            except Exception as exc:  # noqa: BLE001
+                with lock:
+                    outcomes.append(f"error:{exc!r}")
+
+        threads = [threading.Thread(target=submit, args=(f"e-{i}",)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(outcomes), ["conflict", "ok"])
+        self.assertEqual(self.engine.get(iid).revision, 2)
+        self.assertEqual(self.engine.get(iid)["state"]["completed"], ["reserve-stock"])
+        # The loser's eventId wrote no ledger row.
+        rows = self.engine._db.execute(
+            "SELECT COUNT(*) FROM instance_events WHERE instance_id = ?", (iid,)
+        ).fetchone()[0]
+        self.assertEqual(rows, 1)
+
+
+class InstanceRevisionPersistenceTests(unittest.TestCase):
+    """Revisions survive reopen; legacy files read as revision 1, then jump to 2."""
+
+    def setUp(self) -> None:
+        fd, self.path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+
+    def tearDown(self) -> None:
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+    def test_revision_survives_reopen(self) -> None:
+        engine = Engine(self.path)
+        iid = engine.start("order", {})["id"]
+        engine.advance(iid, "succeeded", event_id="e-1")
+        engine.advance(iid, "succeeded", event_id="e-2")
+        engine.close()
+
+        engine = Engine(self.path)
+        try:
+            self.assertEqual(engine.get(iid).revision, 3)
+            result = engine.advance(iid, "succeeded", event_id="e-3")
+            self.assertEqual(result.revision, 4)
+            engine.close()
+
+            engine = Engine(self.path)
+            self.assertEqual(engine.get(iid).revision, 4)
+            # A replay after reopen still reports the current revision for its ETag.
+            replay = engine.advance(iid, "succeeded", event_id="e-1")
+            self.assertEqual(replay.revision, 4)
+        finally:
+            engine.close()
+
+    def test_legacy_instance_reads_as_revision_1_then_becomes_2(self) -> None:
+        legacy = sqlite3.connect(self.path)
+        legacy.execute(
+            "CREATE TABLE instances (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, state TEXT NOT NULL)"
+        )
+        state = initial_state(WORKFLOWS["order"], {})
+        state = apply_outcome(WORKFLOWS["order"], state, "succeeded")
+        legacy.execute("INSERT INTO instances VALUES (?, ?, ?)",
+                       ("legacy-id", "order", json.dumps(state)))
+        legacy.commit()
+        legacy.close()
+
+        engine = Engine(self.path)
+        try:
+            # No historical change count is fabricated: reads as revision 1.
+            current = engine.get("legacy-id")
+            self.assertEqual(current.revision, 1)
+            self.assertEqual(current["state"]["completed"], ["reserve-stock"])
+            self.assertEqual(engine.audit("legacy-id").revision, 1)
+            # A rejected call (signal to a step that is not waiting) does not bump.
+            with self.assertRaises(InvalidTransition):
+                engine.signal("legacy-id", "anything", event_id="s-x")
+            self.assertEqual(engine.get("legacy-id").revision, 1)
+            # First real post-upgrade change jumps 1 -> 2 and persists that way.
+            result = engine.advance("legacy-id", "succeeded", event_id="e-1")
+            self.assertEqual(result.revision, 2)
+            stored = engine._db.execute(
+                "SELECT instance_version FROM instances WHERE id = ?", ("legacy-id",)
+            ).fetchone()[0]
+            self.assertEqual(stored, 2)
+            engine.close()
+
+            engine = Engine(self.path)
+            self.assertEqual(engine.get("legacy-id").revision, 2)
+        finally:
+            engine.close()
+
+
+class InstanceRevisionHttpTests(unittest.TestCase):
+    """ETag emission and If-Match precondition over HTTP."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from saga import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def call(self, method: str, path: str, body: dict | None = None, headers: dict | None = None):
+        data = None if body is None else json.dumps(body).encode()
+        hdrs = {"Content-Type": "application/json"}
+        if headers:
+            hdrs.update(headers)
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data,
+                                         method=method, headers=hdrs)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), response.headers
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), error.headers
+
+    def _start(self, workflow: str = "order"):
+        status, body, headers = self.call("POST", f"/v1/workflows/{workflow}/instances", {})
+        self.assertEqual(status, 201)
+        return body["id"], headers
+
+    def test_etag_emitted_on_start_get_and_audit(self) -> None:
+        iid, start_headers = self._start()
+        self.assertEqual(start_headers.get("ETag"), '"1"')
+        status, _, headers = self.call("GET", f"/v1/instances/{iid}")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("ETag"), '"1"')
+        status, _, headers = self.call("GET", f"/v1/instances/{iid}/audit")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("ETag"), '"1"')
+
+    def test_successful_changes_return_current_etag(self) -> None:
+        iid, _ = self._start()
+        status, body, headers = self.call("POST", f"/v1/instances/{iid}/events",
+                                          {"outcome": "succeeded", "eventId": "e-1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("ETag"), '"2"')
+        status, body, headers = self.call("POST", f"/v1/instances/{iid}/events",
+                                          {"outcome": "succeeded", "eventId": "e-2"},
+                                          {"If-Match": '"2"'})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("ETag"), '"3"')
+        self.assertEqual(self.call("GET", f"/v1/instances/{iid}")[2].get("ETag"), '"3"')
+
+    def test_stale_if_match_is_409_and_state_unchanged(self) -> None:
+        iid, _ = self._start()
+        self.call("POST", f"/v1/instances/{iid}/events", {"outcome": "succeeded", "eventId": "e-1"})
+        status, body, headers = self.call("POST", f"/v1/instances/{iid}/events",
+                                          {"outcome": "succeeded", "eventId": "e-2"},
+                                          {"If-Match": '"1"'})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "invalid_transition")
+        self.assertIsNone(headers.get("ETag"))  # error responses carry no ETag
+        # The rejected call did not move the revision or write a ledger row.
+        self.assertEqual(self.call("GET", f"/v1/instances/{iid}")[2].get("ETag"), '"2"')
+        status, audit, _ = self.call("GET", f"/v1/instances/{iid}/audit")
+        self.assertEqual([h["eventId"] for h in audit["history"]], ["e-1"])
+
+    def test_malformed_if_match_is_400(self) -> None:
+        iid, _ = self._start()
+        for raw in ("", "1", 'W/"1"', "*", '"1", "2"', '"01"', '"-1"', '"1.0"', '""'):
+            status, body, _ = self.call("POST", f"/v1/instances/{iid}/events",
+                                        {"outcome": "succeeded", "eventId": "e-bad"},
+                                        {"If-Match": raw})
+            self.assertEqual(status, 400, repr(raw))
+            self.assertEqual(body["error"]["code"], "invalid_request", repr(raw))
+        # Nothing was written: instance still at revision 1 with an empty ledger.
+        self.assertEqual(self.call("GET", f"/v1/instances/{iid}")[2].get("ETag"), '"1"')
+        status, audit, _ = self.call("GET", f"/v1/instances/{iid}/audit")
+        self.assertEqual(audit["history"], [])
+
+    def test_omitted_if_match_keeps_baseline_contract(self) -> None:
+        iid, _ = self._start()
+        # No header: advances behave exactly as before, including terminal 409s.
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/events",
+                                   {"outcome": "failed"})[0], 200)
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/events",
+                                   {"outcome": "succeeded"})[0], 409)
+
+    def test_replay_on_stale_if_match_returns_first_response_with_current_etag(self) -> None:
+        iid, _ = self._start()
+        status, first, first_headers = self.call(
+            "POST", f"/v1/instances/{iid}/events",
+            {"outcome": "succeeded", "detail": {"n": 1}, "eventId": "e-1"})
+        self.assertEqual(first_headers.get("ETag"), '"2"')
+        self.call("POST", f"/v1/instances/{iid}/events", {"outcome": "succeeded", "eventId": "e-2"})
+        # Stale precondition, but e-1 is a replay: 200 with the first body and the
+        # ETag of the *current* revision.
+        status, replay, headers = self.call(
+            "POST", f"/v1/instances/{iid}/events",
+            {"outcome": "succeeded", "detail": {"n": 1}, "eventId": "e-1"},
+            {"If-Match": '"1"'})
+        self.assertEqual(status, 200)
+        self.assertEqual(replay, first)
+        self.assertEqual(headers.get("ETag"), '"3"')
+
+    def test_signal_and_migrate_if_match_end_to_end(self) -> None:
+        self.call("PUT", "/v1/workflows/ccflow", {"steps": [
+            {"name": "s1", "compensation": "c1", "await": {"event": "go"}},
+            {"name": "s2", "compensation": "c2"},
+        ]})
+        self.call("PUT", "/v1/workflows/ccflow", {"steps": [
+            {"name": "s1", "compensation": "c1", "await": {"event": "go"}},
+            {"name": "s2", "compensation": "c2-new"},
+        ]})
+        iid = self.call("POST", "/v1/workflows/ccflow/instances", {"version": 1})[1]["id"]
+        # While waiting at s1: a stale precondition blocks the migration, a
+        # matching one repins to v2 with state preserved and revision -> 2.
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/migrate",
+                                   {"version": 2}, {"If-Match": '"7"'})[0], 409)
+        status, body, headers = self.call("POST", f"/v1/instances/{iid}/migrate",
+                                          {"version": 2}, {"If-Match": '"1"'})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("ETag"), '"2"')
+        self.assertEqual(body["workflowVersion"], 2)
+        self.assertEqual((body["state"]["status"], body["state"]["step"], body["state"]["waitingFor"]),
+                         ("running", "s1", "go"))
+        # A stale signal is rejected; the matching precondition unblocks and
+        # enters s2 under the now-pinned v2 definition, revision -> 3.
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/signals",
+                                   {"event": "go", "eventId": "s-0"},
+                                   {"If-Match": '"1"'})[0], 409)
+        status, _, headers = self.call("POST", f"/v1/instances/{iid}/signals",
+                                       {"event": "go", "eventId": "s-1"},
+                                       {"If-Match": '"2"'})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("ETag"), '"3"')
+        self.assertEqual(self.call("GET", f"/v1/instances/{iid}")[2].get("ETag"), '"3"')
+        # A fail now compensates with the v2 name, bumping revision once more.
+        status, body, headers = self.call("POST", f"/v1/instances/{iid}/events",
+                                          {"outcome": "failed", "eventId": "e-1"},
+                                          {"If-Match": '"3"'})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["state"]["compensated"], ["c2-new", "c1"])
+        self.assertEqual(headers.get("ETag"), '"4"')
 
 
 if __name__ == "__main__":
