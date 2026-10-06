@@ -10,7 +10,8 @@ import unittest
 import urllib.error
 import urllib.request
 
-from saga import Engine, InstanceNotFound, InvalidRequest, InvalidTransition, WORKFLOWS, apply_outcome, initial_state
+from saga import (Engine, InstanceNotFound, InvalidRequest, InvalidTransition, WORKFLOWS,
+                  apply_outcome, apply_signal, initial_state)
 
 
 class TransitionUnitTests(unittest.TestCase):
@@ -628,6 +629,419 @@ class RetryHttpTests(unittest.TestCase):
         status, body = self.call("POST", f"/v1/instances/{iid}/events", {"outcome": "succeeded"})
         self.assertEqual(body["state"]["status"], "completed")
         self.assertIsNone(body["state"]["failure"])
+
+
+class AwaitDefinitionTests(unittest.TestCase):
+    """Validation of the optional per-step await object."""
+
+    def setUp(self) -> None:
+        self.engine = Engine()
+
+    def tearDown(self) -> None:
+        self.engine.close()
+
+    def test_valid_await_accepted_and_round_trips(self) -> None:
+        workflow = self.engine.define("w", {"steps": [{"name": "a", "await": {"event": "go"}}]})
+        self.assertEqual(workflow["steps"][0]["await"], {"event": "go"})
+        self.assertEqual(self.engine.workflow("w")["steps"][0]["await"], {"event": "go"})
+
+    def test_invalid_await_shapes_are_400_and_keep_existing_definition(self) -> None:
+        self.engine.define("w", {"steps": [{"name": "a", "await": {"event": "go"}}]})
+        bad_awaits = [
+            None,                      # null
+            "go",                      # not an object
+            ["event"],                 # not an object
+            {},                        # missing event
+            {"event": None},           # null event
+            {"event": ""},             # empty event
+            {"event": 123},            # non-string event
+            {"event": True},           # non-string event
+            {"event": "x" * 101},      # too long
+            {"event": "go", "x": 1},   # unknown field
+        ]
+        for bad in bad_awaits:
+            with self.assertRaises(InvalidRequest, msg=repr(bad)):
+                self.engine.define("w", {"steps": [{"name": "a", "await": bad}]})
+        self.assertEqual(self.engine.workflow("w")["steps"][0]["await"], {"event": "go"})
+
+    def test_step_without_await_keeps_baseline_shape(self) -> None:
+        workflow = self.engine.define("plain", {"steps": [{"name": "a", "compensation": "undo-a"}]})
+        self.assertNotIn("await", workflow["steps"][0])
+
+    def test_await_boundary_lengths_accepted(self) -> None:
+        for event in ("e", "x" * 100):
+            workflow = self.engine.define(f"w-{len(event)}", {"steps": [{"name": "a", "await": {"event": event}}]})
+            self.assertEqual(workflow["steps"][0]["await"], {"event": event})
+
+
+class AwaitTransitionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.workflow = {
+            "steps": [
+                {"name": "prepare", "compensation": "undo-prepare"},
+                {"name": "wait-approval", "compensation": "undo-approval", "await": {"event": "approved"}},
+                {"name": "wait-payment", "await": {"event": "paid"}},
+                {"name": "finalize", "compensation": "undo-finalize"},
+            ]
+        }
+
+    def test_reaching_await_step_sets_waiting_for(self) -> None:
+        state = initial_state(self.workflow, {})
+        self.assertIsNone(state["waitingFor"])
+        state = apply_outcome(self.workflow, state, "succeeded")
+        self.assertEqual(state["status"], "running")
+        self.assertEqual((state["step"], state["index"], state["attempt"]), ("wait-approval", 1, 1))
+        self.assertEqual(state["waitingFor"], "approved")
+
+    def test_first_step_may_await_from_the_start(self) -> None:
+        workflow = {"steps": [{"name": "gate", "await": {"event": "open"}}, {"name": "run"}]}
+        state = initial_state(workflow, {})
+        self.assertEqual((state["status"], state["step"], state["waitingFor"]), ("running", "gate", "open"))
+
+    def test_events_are_rejected_while_waiting(self) -> None:
+        state = initial_state(self.workflow, {})
+        state = apply_outcome(self.workflow, state, "succeeded")
+        for outcome in ("succeeded", "failed"):
+            with self.assertRaises(InvalidTransition):
+                apply_outcome(self.workflow, state, outcome)
+        # State itself is untouched by the rejections.
+        self.assertEqual(state["waitingFor"], "approved")
+        self.assertEqual(state["completed"], ["prepare"])
+
+    def test_matching_signal_completes_step_and_chains_waits(self) -> None:
+        state = initial_state(self.workflow, {})
+        state = apply_outcome(self.workflow, state, "succeeded")
+        state = apply_signal(self.workflow, state, "approved", {"by": "ops"})
+        self.assertEqual(state["completed"], ["prepare", "wait-approval"])
+        self.assertIsNone(state["failure"])
+        self.assertEqual(state["attempt"], 1)
+        self.assertEqual((state["step"], state["index"]), ("wait-payment", 2))
+        self.assertEqual(state["waitingFor"], "paid")
+
+    def test_signal_on_last_step_completes_instance(self) -> None:
+        workflow = {"steps": [{"name": "gate", "await": {"event": "open"}}]}
+        state = initial_state(workflow, {})
+        state = apply_signal(workflow, state, "open")
+        self.assertEqual(state["status"], "completed")
+        self.assertIsNone(state["step"])
+        self.assertIsNone(state["waitingFor"])
+        self.assertEqual(state["completed"], ["gate"])
+
+    def test_mismatched_or_unexpected_signals_are_409(self) -> None:
+        state = initial_state(self.workflow, {})
+        with self.assertRaises(InvalidTransition):  # not waiting at all
+            apply_signal(self.workflow, state, "approved")
+        state = apply_outcome(self.workflow, state, "succeeded")
+        with self.assertRaises(InvalidTransition):  # waiting for a different event
+            apply_signal(self.workflow, state, "paid")
+        self.assertEqual(state["waitingFor"], "approved")
+
+    def test_terminal_instance_rejects_signals(self) -> None:
+        workflow = {"steps": [{"name": "gate", "await": {"event": "open"}}]}
+        state = apply_signal(workflow, initial_state(workflow, {}), "open")
+        with self.assertRaises(InvalidTransition):
+            apply_signal(workflow, state, "open")
+
+    def test_legacy_state_without_waiting_for_is_read_as_null(self) -> None:
+        state = initial_state(self.workflow, {})
+        del state["waitingFor"]  # simulate a pre-await persisted instance
+        state = apply_outcome(self.workflow, state, "succeeded")
+        self.assertEqual(state["waitingFor"], "approved")
+        # And a legacy state on a non-await step keeps accepting events.
+        legacy = initial_state(self.workflow, {})
+        del legacy["waitingFor"]
+        legacy = apply_outcome(self.workflow, legacy, "failed", "boom")
+        self.assertEqual(legacy["status"], "compensated")
+        self.assertIsNone(legacy["waitingFor"])
+
+    def test_failure_and_compensation_still_work_after_signal(self) -> None:
+        state = initial_state(self.workflow, {})
+        state = apply_outcome(self.workflow, state, "succeeded")
+        state = apply_signal(self.workflow, state, "approved")
+        state = apply_signal(self.workflow, state, "paid")
+        state = apply_outcome(self.workflow, state, "failed", {"reason": "boom"})
+        self.assertEqual(state["status"], "compensated")
+        self.assertEqual(
+            state["compensated"],
+            ["undo-finalize", "undo-approval", "undo-prepare"],
+        )
+        self.assertEqual(state["completed"], ["prepare", "wait-approval", "wait-payment"])
+
+
+class AwaitSignalEngineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = Engine()
+        self.engine.define("gated", {"steps": [
+            {"name": "prepare", "compensation": "undo-prepare"},
+            {"name": "wait-approval", "await": {"event": "approved"}},
+            {"name": "finalize", "compensation": "undo-finalize"},
+        ]})
+
+    def tearDown(self) -> None:
+        self.engine.close()
+
+    def _start_waiting(self) -> str:
+        iid = self.engine.start("gated", {})["id"]
+        self.engine.advance(iid, "succeeded")
+        self.assertEqual(self.engine.get(iid)["state"]["waitingFor"], "approved")
+        return iid
+
+    def _ledger_rows(self, iid: str) -> list:
+        return self.engine._db.execute(
+            "SELECT event_id FROM instance_events WHERE instance_id = ?", (iid,)
+        ).fetchall()
+
+    def test_signal_advances_and_events_work_again_afterwards(self) -> None:
+        iid = self._start_waiting()
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded")  # blocked while waiting
+        result = self.engine.signal(iid, "approved", {"by": "ops"})
+        self.assertEqual(result["state"]["completed"], ["prepare", "wait-approval"])
+        self.assertIsNone(result["state"]["waitingFor"])
+        final = self.engine.advance(iid, "succeeded")
+        self.assertEqual(final["state"]["status"], "completed")
+        self.assertIsNone(final["state"]["step"])
+        self.assertIsNone(final["state"]["waitingFor"])
+
+    def test_signal_rejections_change_nothing_and_write_no_ledger(self) -> None:
+        iid = self._start_waiting()
+        before = self.engine.get(iid)["state"]
+        with self.assertRaises(InstanceNotFound):
+            self.engine.signal("no-such-instance", "approved")
+        with self.assertRaises(InvalidTransition):
+            self.engine.signal(iid, "paid")  # event name mismatch
+        with self.assertRaises(InvalidRequest):
+            self.engine.signal(iid, "")  # illegal event name
+        with self.assertRaises(InvalidRequest):
+            self.engine.signal(iid, "approved", event_id="")  # illegal eventId
+        self.assertEqual(self.engine.get(iid)["state"], before)
+        self.assertEqual(self._ledger_rows(iid), [])
+        # Not waiting at all -> 409 as well.
+        other = self.engine.start("gated", {})["id"]
+        with self.assertRaises(InvalidTransition):
+            self.engine.signal(other, "approved")
+        self.assertEqual(self._ledger_rows(other), [])
+
+    def test_invalid_signal_event_shapes_are_400(self) -> None:
+        iid = self._start_waiting()
+        for bad in (None, "", 123, 12.5, True, ["approved"], {"x": 1}, "x" * 101):
+            with self.assertRaises(InvalidRequest, msg=repr(bad)):
+                self.engine.signal(iid, bad)
+        self.assertEqual(self._ledger_rows(iid), [])
+
+    def test_signal_event_id_replays_first_response_verbatim(self) -> None:
+        iid = self._start_waiting()
+        first = self.engine.signal(iid, "approved", {"by": "ops"}, event_id="sig-1")
+        self.assertEqual(first["state"]["step"], "finalize")
+        replay = self.engine.signal(iid, "approved", {"by": "ops"}, event_id="sig-1")
+        self.assertEqual(replay, first)
+        # Omitted detail equals explicit null, like events.
+        other = self._start_waiting()
+        first2 = self.engine.signal(other, "approved", None, event_id="sig-2")
+        self.assertEqual(self.engine.signal(other, "approved", event_id="sig-2"), first2)
+        # The instance advanced exactly once.
+        self.assertEqual(self.engine.get(iid)["state"]["completed"], ["prepare", "wait-approval"])
+
+    def test_signal_event_id_conflict_is_409_and_state_unchanged(self) -> None:
+        iid = self._start_waiting()
+        self.engine.signal(iid, "approved", {"by": "ops"}, event_id="sig-1")
+        for bad in ({"by": "someone-else"}, None):
+            with self.assertRaises(InvalidTransition):
+                self.engine.signal(iid, "approved", bad, event_id="sig-1")
+        with self.assertRaises(InvalidTransition):
+            self.engine.signal(iid, "other-event", {"by": "ops"}, event_id="sig-1")
+        self.assertEqual(self.engine.get(iid)["state"]["step"], "finalize")
+
+    def test_signal_event_id_scoped_per_instance(self) -> None:
+        a = self._start_waiting()
+        b = self._start_waiting()
+        ra = self.engine.signal(a, "approved", event_id="shared")
+        rb = self.engine.signal(b, "approved", event_id="shared")
+        self.assertEqual((ra["id"], rb["id"]), (a, b))
+
+    def test_signal_and_event_ledgers_share_event_id_namespace(self) -> None:
+        iid = self._start_waiting()
+        self.engine.signal(iid, "approved", event_id="dup")
+        # The same eventId cannot be reused for a different-shaped request.
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="dup")
+
+    def test_terminal_instance_rejects_signals_without_ledger_writes(self) -> None:
+        iid = self._start_waiting()
+        self.engine.signal(iid, "approved")
+        self.engine.advance(iid, "succeeded")
+        self.assertEqual(self.engine.get(iid)["state"]["status"], "completed")
+        with self.assertRaises(InvalidTransition):
+            self.engine.signal(iid, "approved", event_id="late")
+        self.assertEqual(self._ledger_rows(iid), [])
+
+    def test_concurrent_duplicate_signals_one_writer_one_replay(self) -> None:
+        iid = self._start_waiting()
+        barrier = threading.Barrier(2)
+        results: list[dict] = []
+        errors: list[Exception] = []
+
+        def submit() -> None:
+            try:
+                barrier.wait()
+                results.append(self.engine.signal(iid, "approved", event_id="race"))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=submit) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(self.engine.get(iid)["state"]["completed"], ["prepare", "wait-approval"])
+        self.assertEqual(self._ledger_rows(iid), [("race",)])
+
+
+class AwaitPersistenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        fd, self.path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+
+    def tearDown(self) -> None:
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+    def test_waiting_state_and_signal_ledger_survive_reopen(self) -> None:
+        engine = Engine(self.path)
+        engine.define("gated", {"steps": [
+            {"name": "prepare"},
+            {"name": "wait-approval", "await": {"event": "approved"}},
+            {"name": "wait-payment", "await": {"event": "paid"}},
+        ]})
+        iid = engine.start("gated", {})["id"]
+        engine.advance(iid, "succeeded", event_id="ev-0")
+        first = engine.signal(iid, "approved", {"by": "ops"}, event_id="sig-1")
+        engine.close()
+
+        engine = Engine(self.path)
+        try:
+            # Workflow definitions are in-memory, so the reopened service re-defines it.
+            engine.define("gated", {"steps": [
+                {"name": "prepare"},
+                {"name": "wait-approval", "await": {"event": "approved"}},
+                {"name": "wait-payment", "await": {"event": "paid"}},
+            ]})
+            # The instance is still waiting for the next event after reopen.
+            state = engine.get(iid)["state"]
+            self.assertEqual(state["waitingFor"], "paid")
+            self.assertEqual(state["status"], "running")
+            with self.assertRaises(InvalidTransition):
+                engine.advance(iid, "succeeded")
+            # Signal replay hits the saved response; event replay still works too.
+            self.assertEqual(engine.signal(iid, "approved", {"by": "ops"}, event_id="sig-1"), first)
+            self.assertEqual(engine.advance(iid, "succeeded", event_id="ev-0")["state"]["waitingFor"], "approved")
+            # And the flow can be completed.
+            final = engine.signal(iid, "paid")
+            self.assertEqual(final["state"]["status"], "completed")
+            self.assertIsNone(final["state"]["waitingFor"])
+        finally:
+            engine.close()
+
+    def test_legacy_instance_without_waiting_for_keeps_accepting_events(self) -> None:
+        legacy = sqlite3.connect(self.path)
+        legacy.execute("CREATE TABLE instances (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, state TEXT NOT NULL)")
+        state = initial_state(WORKFLOWS["order"], {})
+        del state["waitingFor"]
+        legacy.execute("INSERT INTO instances VALUES (?, ?, ?)", ("old-1", "order", json.dumps(state)))
+        legacy.commit()
+        legacy.close()
+
+        engine = Engine(self.path)
+        try:
+            self.assertNotIn("waitingFor", engine.get("old-1")["state"])
+            result = engine.advance("old-1", "succeeded", event_id="ev-1")
+            self.assertIsNone(result["state"]["waitingFor"])
+            with self.assertRaises(InvalidTransition):
+                engine.signal("old-1", "anything")
+        finally:
+            engine.close()
+
+
+class AwaitHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from saga import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def call(self, method: str, path: str, body: dict | None = None):
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def test_put_rejects_bad_await_and_preserves_existing_workflow(self) -> None:
+        status, _ = self.call("PUT", "/v1/workflows/aw", {"steps": [{"name": "a", "await": {"event": "go"}}]})
+        self.assertEqual(status, 200)
+        for bad in ({"await": None}, {"await": {}}, {"await": {"event": ""}}, {"await": {"event": 1}},
+                    {"await": {"event": "go", "timeout": 5}}, {"await": "go"}):
+            status, body = self.call("PUT", "/v1/workflows/aw", {"steps": [{"name": "a", **bad}]})
+            self.assertEqual(status, 400, bad)
+            self.assertEqual(body["error"]["code"], "invalid_request")
+        status, body = self.call("PUT", "/v1/workflows/aw", {"steps": [{"name": "a", "await": {"event": "go"}}]})
+        self.assertEqual((status, body["steps"][0]["await"]), (200, {"event": "go"}))
+
+    def test_http_await_signal_flow_end_to_end(self) -> None:
+        self.call("PUT", "/v1/workflows/aflow", {"steps": [
+            {"name": "s1", "compensation": "c1"},
+            {"name": "s2", "await": {"event": "approved"}},
+            {"name": "s3", "await": {"event": "paid"}},
+        ]})
+        status, body = self.call("POST", "/v1/workflows/aflow/instances", {})
+        self.assertEqual(status, 201)
+        iid = body["id"]
+        self.assertIsNone(body["state"]["waitingFor"])
+        status, body = self.call("POST", f"/v1/instances/{iid}/events", {"outcome": "succeeded"})
+        self.assertEqual((status, body["state"]["waitingFor"]), (200, "approved"))
+        self.assertEqual((body["state"]["step"], body["state"]["index"], body["state"]["attempt"]), ("s2", 1, 1))
+        # Events are blocked while the instance waits.
+        status, body = self.call("POST", f"/v1/instances/{iid}/events", {"outcome": "succeeded"})
+        self.assertEqual((status, body["error"]["code"]), (409, "invalid_transition"))
+        # Mismatched and malformed signals are rejected without state changes.
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/signals", {"event": "paid"})[0], 409)
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/signals", {"event": "approved", "extra": 1})[0], 400)
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/signals", {"detail": 1})[0], 400)
+        self.assertEqual(self.call("POST", "/v1/instances/missing/signals", {"event": "approved"})[0], 404)
+        # Matching signal completes the step and chains into the next wait.
+        status, body = self.call("POST", f"/v1/instances/{iid}/signals",
+                                 {"event": "approved", "detail": {"by": "ops"}, "eventId": "sig-1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["state"]["completed"], ["s1", "s2"])
+        self.assertEqual(body["state"]["waitingFor"], "paid")
+        self.assertIsNone(body["state"]["failure"])
+        self.assertEqual(body["state"]["attempt"], 1)
+        # Replay returns the first response verbatim; a conflict is a 409.
+        status, replay = self.call("POST", f"/v1/instances/{iid}/signals",
+                                   {"event": "approved", "detail": {"by": "ops"}, "eventId": "sig-1"})
+        self.assertEqual((status, replay), (200, body))
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/signals",
+                                   {"event": "approved", "eventId": "sig-1"})[0], 409)
+        # Final signal completes the instance.
+        status, body = self.call("POST", f"/v1/instances/{iid}/signals", {"event": "paid"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["state"]["status"], "completed")
+        self.assertIsNone(body["state"]["step"])
+        self.assertIsNone(body["state"]["waitingFor"])
+        # Terminal instance rejects further signals.
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/signals", {"event": "paid"})[0], 409)
 
 
 if __name__ == "__main__":

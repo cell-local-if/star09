@@ -15,10 +15,13 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 ## 概念
 
 - **工作流定义**：`{"steps":[{"name":"reserve-stock","compensation":"release-stock"}, ...]}`（1–20 步）。
-  每步可带可选 `retry` 对象，只允许 `{"maxAttempts": <整数 2..10>}`。
+  每步可带可选 `retry` 对象，只允许 `{"maxAttempts": <整数 2..10>}`；
+  可带可选 `await` 对象，只允许 `{"event": "<事件名>"}`（非空字符串，≤100 字符）。
 - **实例状态**：`{"status":"running|completed|compensated", "step": <当前步骤名或 null>, "index": <int>,
   "attempt": <当前步骤的尝试序号，从 1 开始，进入新步骤时重置为 1>,
-  "completed":[<已完成步骤名>], "compensated":[<将/已执行的补偿名，逆序>], "context": {...}, "failure": null|{...}}`。
+  "completed":[<已完成步骤名>], "compensated":[<将/已执行的补偿名，逆序>], "context": {...},
+  "failure": null|{...}, "waitingFor": <正在等待的事件名或 null>}`。
+  旧实例缺少 `waitingFor` 字段时按 `null` 读取。
 - 状态转移是**纯函数**：同样的 `(状态, outcome)` 永远得到同样的下一个状态。
 
 ## 接口
@@ -34,6 +37,8 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 定义非法（step 非对象、`name` 空/超 100 字符、未知字段、步数越界）⇒ `400 invalid_request`。
 步骤的 `retry` 只允许 `{"maxAttempts": n}`（整数，2–10）；`retry` 缺失 `maxAttempts`、含未知字段、
 值为布尔/非整数、小于 2 或大于 10 ⇒ `400 invalid_request`，已有定义保持不变。
+步骤的 `await` 只允许 `{"event": "<事件名>"}`（非空字符串，≤100 字符）；`await` 为 null/非对象、
+缺失 `event`、含未知字段、事件名为空/非字符串/超长 ⇒ `400 invalid_request`，已有定义保持不变。
 
 ### `POST /v1/workflows/{name}/instances`
 请求体：`{"context": {...}}`（可省）→ **`201`** `{"id": <uuid>, "workflow": name, "state": {...}}`。
@@ -48,6 +53,23 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
   - 否则（无 `retry`，或 `attempt` 已等于 `maxAttempts`）：`status="compensated"`，
     `compensated` = 本步及之前所有**带补偿**的步骤名**逆序**。
 - 实例已终态（completed/compensated）再发事件 ⇒ **`409 invalid_transition`**；`outcome` 非法 ⇒ `400`。
+- 实例处于等待（`waitingFor` 非 null）时，本接口一律返回 **`409 invalid_transition`**；
+  收到匹配信号（见下）后才可继续提交 `succeeded`/`failed`。
+
+### `POST /v1/instances/{id}/signals`
+请求体：`{"event": "<事件名>", "detail": <任意 JSON>, "eventId": "<可选>"}` →
+`200 {"id":..., "workflow":..., "state": {...}}`。
+- 当前步骤带 `await` 时实例停留在该步（`running`，`step`/`index`/`attempt` 不变），
+  `waitingFor` 为事件名；`event` 与 `waitingFor` 匹配时按**成功结果**完成当前步骤：
+  `completed` 加入步骤名、`failure` 清除、`attempt` 重置为 1 并进入下一步；
+  下一步仍带 `await` 则 `waitingFor` 更新为新事件名，已是最后一步则 `status="completed"`
+  且 `step`/`waitingFor` 均为 `null`。
+- 请求体非法（缺 `event`、未知字段、`event` 空/非字符串/超长）或 `eventId` 非法 ⇒ `400 invalid_request`；
+  实例不存在 ⇒ `404 not_found`；当前无等待或事件名不匹配 ⇒ `409 invalid_transition`。
+  这些拒绝不改变状态，也不写幂等账本。
+- `eventId` 的校验、实例范围幂等与完整响应回放规则与事件接口完全一致（同一张
+  `instance_events` 账本）：同标识同 `event`/`detail` 返回首次 200 响应原文且不改状态，
+  不同则 `409 invalid_transition`；并发重复只有一次首次处理。
 
 #### 事件幂等（可选 `eventId`）
 - 不带 `eventId`：行为不变，每次调用都重新进入状态机（终态实例仍返回 `409`）。
@@ -77,5 +99,5 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 
 ## 未实现（后续任务候选，非固定题单）
 
-超时与死信、并发与抢占、外部事件等待、编排版本迁移与在飞实例、分区与顺序保证、
+超时与死信、并发与抢占、编排版本迁移与在飞实例、分区与顺序保证、
 持久化恢复与重放、限流与背压、可视化查询与审计回放、失败注入测试。

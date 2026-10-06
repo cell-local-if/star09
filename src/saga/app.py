@@ -47,6 +47,12 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
 _UNSET = object()
 
 
+def _validate_event_id(event_id: Any) -> str:
+    if not isinstance(event_id, str) or not event_id or len(event_id) > 100:
+        raise InvalidRequest("eventId must be a non-empty string of at most 100 characters")
+    return event_id
+
+
 def validate_workflow(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise InvalidRequest("body must be a JSON object")
@@ -57,8 +63,8 @@ def validate_workflow(payload: Any) -> dict[str, Any]:
         raise InvalidRequest("steps must be an array of 1..20 items")
     cleaned = []
     for index, step in enumerate(steps):
-        if not isinstance(step, dict) or set(step) - {"name", "compensation", "retry"}:
-            raise InvalidRequest(f"steps[{index}] must be an object with name/compensation/retry")
+        if not isinstance(step, dict) or set(step) - {"name", "compensation", "retry", "await"}:
+            raise InvalidRequest(f"steps[{index}] must be an object with name/compensation/retry/await")
         name, compensation = step.get("name"), step.get("compensation")
         if not isinstance(name, str) or not name or len(name) > 100:
             raise InvalidRequest(f"steps[{index}].name must be a non-empty string of at most 100 characters")
@@ -67,6 +73,8 @@ def validate_workflow(payload: Any) -> dict[str, Any]:
         cleaned_step: dict[str, Any] = {"name": name, "compensation": compensation}
         if "retry" in step:
             cleaned_step["retry"] = _validate_retry(step["retry"], index)
+        if "await" in step:
+            cleaned_step["await"] = _validate_await(step["await"], index)
         cleaned.append(cleaned_step)
     return {"steps": cleaned}
 
@@ -85,50 +93,102 @@ def _validate_retry(retry: Any, index: int) -> dict[str, Any]:
     return {"maxAttempts": max_attempts}
 
 
+def _validate_await(await_cfg: Any, index: int) -> dict[str, Any]:
+    """A step's await config is exactly {"event": <non-empty string <=100>}; anything else is 400."""
+    if not isinstance(await_cfg, dict) or set(await_cfg) - {"event"}:
+        raise InvalidRequest(f"steps[{index}].await must be an object with only event")
+    if "event" not in await_cfg:
+        raise InvalidRequest(f"steps[{index}].await.event is required")
+    event = await_cfg["event"]
+    if not isinstance(event, str) or not event or len(event) > 100:
+        raise InvalidRequest(f"steps[{index}].await.event must be a non-empty string of at most 100 characters")
+    return {"event": event}
+
+
+def _await_event(step: dict[str, Any]) -> str | None:
+    """The event name a step waits for, or None when the step has no await config."""
+    await_cfg = step.get("await")
+    if not await_cfg:
+        return None
+    return await_cfg["event"]
+
+
 def initial_state(workflow: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
-    return {"status": "running", "step": workflow["steps"][0]["name"], "index": 0, "attempt": 1,
-            "completed": [], "compensated": [], "context": dict(context), "failure": None}
+    first = workflow["steps"][0]
+    return {"status": "running", "step": first["name"], "index": 0, "attempt": 1,
+            "completed": [], "compensated": [], "context": dict(context), "failure": None,
+            "waitingFor": _await_event(first)}
 
 
-def apply_outcome(workflow: dict[str, Any], state: dict[str, Any], outcome: str, detail: Any = None) -> dict[str, Any]:
-    """Pure transition: the same (state, outcome) always yields the same next state."""
-    if state["status"] != "running":
-        raise InvalidTransition(f"instance is {state['status']}, not running")
-    if outcome not in {"succeeded", "failed"}:
-        raise InvalidRequest("outcome must be 'succeeded' or 'failed'")
+def _complete_step(workflow: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    """Success transition shared by outcome events and matching signals: the current
+    step joins ``completed``, ``failure`` clears, ``attempt`` resets to 1, and the
+    instance advances — into ``waitingFor`` when the next step awaits an event, into
+    ``completed`` (with ``step``/``waitingFor`` null) when none remains."""
     steps = workflow["steps"]
     index = int(state["index"])
-    # Instances persisted before the attempt field existed are treated as attempt=1.
-    attempt = int(state.get("attempt", 1))
     next_state = json.loads(json.dumps(state))
-    next_state["attempt"] = attempt
-    if outcome == "failed":
-        next_state["failure"] = {"step": steps[index]["name"], "detail": detail}
-        retry = steps[index].get("retry") or {}
-        max_attempts = retry.get("maxAttempts")
-        if max_attempts is not None and attempt < max_attempts:
-            # Retryable failure: stay on the same step, bump the attempt counter,
-            # keep completed/compensated untouched.
-            next_state["attempt"] = attempt + 1
-            return next_state
-        pending = [s["compensation"] for s in steps[: index + 1] if s.get("compensation")]
-        next_state["compensated"] = list(reversed(pending))
-        next_state["completed"] = state["completed"]
-        next_state["status"] = "compensated"
-        next_state["step"] = None
-        return next_state
-    completed = list(state["completed"]) + [steps[index]["name"]]
-    next_state["completed"] = completed
+    next_state["completed"] = list(state["completed"]) + [steps[index]["name"]]
     next_state["failure"] = None
     next_state["attempt"] = 1
     if index + 1 >= len(steps):
         next_state["status"] = "completed"
         next_state["step"] = None
         next_state["index"] = index
+        next_state["waitingFor"] = None
         return next_state
     next_state["index"] = index + 1
     next_state["step"] = steps[index + 1]["name"]
+    next_state["waitingFor"] = _await_event(steps[index + 1])
     return next_state
+
+
+def apply_outcome(workflow: dict[str, Any], state: dict[str, Any], outcome: str, detail: Any = None) -> dict[str, Any]:
+    """Pure transition: the same (state, outcome) always yields the same next state."""
+    if state["status"] != "running":
+        raise InvalidTransition(f"instance is {state['status']}, not running")
+    # Instances persisted before the waitingFor field existed are treated as waitingFor=None.
+    waiting = state.get("waitingFor")
+    if waiting is not None:
+        raise InvalidTransition(f"instance is waiting for event {waiting!r}")
+    if outcome not in {"succeeded", "failed"}:
+        raise InvalidRequest("outcome must be 'succeeded' or 'failed'")
+    if outcome == "succeeded":
+        return _complete_step(workflow, state)
+    steps = workflow["steps"]
+    index = int(state["index"])
+    # Instances persisted before the attempt field existed are treated as attempt=1.
+    attempt = int(state.get("attempt", 1))
+    next_state = json.loads(json.dumps(state))
+    next_state["attempt"] = attempt
+    next_state["waitingFor"] = None
+    next_state["failure"] = {"step": steps[index]["name"], "detail": detail}
+    retry = steps[index].get("retry") or {}
+    max_attempts = retry.get("maxAttempts")
+    if max_attempts is not None and attempt < max_attempts:
+        # Retryable failure: stay on the same step, bump the attempt counter,
+        # keep completed/compensated untouched.
+        next_state["attempt"] = attempt + 1
+        return next_state
+    pending = [s["compensation"] for s in steps[: index + 1] if s.get("compensation")]
+    next_state["compensated"] = list(reversed(pending))
+    next_state["completed"] = state["completed"]
+    next_state["status"] = "compensated"
+    next_state["step"] = None
+    return next_state
+
+
+def apply_signal(workflow: dict[str, Any], state: dict[str, Any], event: Any, detail: Any = None) -> dict[str, Any]:
+    """Pure transition for an external signal: the named event completes the awaited
+    step as a success. Anything else leaves the state untouched (409)."""
+    if state["status"] != "running":
+        raise InvalidTransition(f"instance is {state['status']}, not running")
+    waiting = state.get("waitingFor")
+    if waiting is None:
+        raise InvalidTransition("instance is not waiting for an event")
+    if event != waiting:
+        raise InvalidTransition(f"instance is waiting for event {waiting!r}, not {event!r}")
+    return _complete_step(workflow, state)
 
 
 class Engine:
@@ -199,17 +259,9 @@ class Engine:
             if row is None:
                 raise InstanceNotFound(f"no instance {instance_id}")
             if normalized is not None:
-                ledger = self._db.execute(
-                    "SELECT request, response FROM instance_events WHERE instance_id = ? AND event_id = ?",
-                    (instance_id, event_id),
-                ).fetchone()
-                if ledger is not None:
-                    stored_request, stored_response = ledger
-                    if stored_request != json.dumps(normalized, separators=(",", ":"), sort_keys=True):
-                        raise InvalidTransition(
-                            f"eventId {event_id!r} was already submitted for this instance with a different outcome/detail"
-                        )
-                    return json.loads(stored_response)
+                replayed = self._ledger_lookup(instance_id, event_id, normalized)
+                if replayed is not None:
+                    return replayed
             workflow = self.workflow(row[0])
             state = apply_outcome(workflow, json.loads(row[1]), outcome, detail)
             response = {"id": instance_id, "workflow": row[0], "state": state}
@@ -235,14 +287,76 @@ class Engine:
         A missing detail and an explicit null detail are the same value, so the
         normalized form always carries ``"detail": null`` unless a detail was given.
         """
-        if not isinstance(event_id, str) or not event_id or len(event_id) > 100:
-            raise InvalidRequest("eventId must be a non-empty string of at most 100 characters")
-        normalized: dict[str, Any] = {"eventId": event_id, "outcome": outcome}
+        normalized: dict[str, Any] = {"eventId": _validate_event_id(event_id), "outcome": outcome}
         if detail is not None:
             normalized["detail"] = detail
         else:
             normalized["detail"] = None
         return normalized
+
+    @staticmethod
+    def _normalize_signal_request(event_id: Any, event: Any, detail: Any) -> dict[str, Any]:
+        """Same canonicalization as events, keyed by ``event`` instead of ``outcome``."""
+        normalized: dict[str, Any] = {"eventId": _validate_event_id(event_id), "event": event}
+        if detail is not None:
+            normalized["detail"] = detail
+        else:
+            normalized["detail"] = None
+        return normalized
+
+    def _ledger_lookup(self, instance_id: str, event_id: str, normalized: dict[str, Any]) -> dict[str, Any] | None:
+        """Return the stored first response for (instance, eventId); 409 when the same
+        identifier was submitted with a different request; None when unseen."""
+        ledger = self._db.execute(
+            "SELECT request, response FROM instance_events WHERE instance_id = ? AND event_id = ?",
+            (instance_id, event_id),
+        ).fetchone()
+        if ledger is None:
+            return None
+        stored_request, stored_response = ledger
+        if stored_request != json.dumps(normalized, separators=(",", ":"), sort_keys=True):
+            raise InvalidTransition(
+                f"eventId {event_id!r} was already submitted for this instance with a different request"
+            )
+        return json.loads(stored_response)
+
+    def signal(self, instance_id: str, event: Any, detail: Any = None, event_id: Any = _UNSET) -> dict[str, Any]:
+        """Deliver an external event to a waiting instance, atomically.
+
+        Mirrors :meth:`advance`: without ``event_id`` every call re-enters the state
+        machine; with one the (instance_id, event_id) pair is idempotent — an equal
+        normalized request replays the first response verbatim, a different one is a
+        409. Rejections (bad request, missing instance, not waiting, mismatched event)
+        change nothing and write no ledger rows.
+        """
+        if not isinstance(event, str) or not event or len(event) > 100:
+            raise InvalidRequest("event must be a non-empty string of at most 100 characters")
+        normalized = None
+        if event_id is not _UNSET:
+            normalized = self._normalize_signal_request(event_id, event, detail)
+            event_id = normalized["eventId"]
+        with self._lock:
+            row = self._db.execute("SELECT workflow, state FROM instances WHERE id = ?", (instance_id,)).fetchone()
+            if row is None:
+                raise InstanceNotFound(f"no instance {instance_id}")
+            if normalized is not None:
+                replayed = self._ledger_lookup(instance_id, event_id, normalized)
+                if replayed is not None:
+                    return replayed
+            workflow = self.workflow(row[0])
+            state = apply_signal(workflow, json.loads(row[1]), event, detail)
+            response = {"id": instance_id, "workflow": row[0], "state": state}
+            self._db.execute("UPDATE instances SET state = ? WHERE id = ?", (json.dumps(state), instance_id))
+            if normalized is not None:
+                # Transition and ledger insert commit together, exactly like advance().
+                self._db.execute(
+                    "INSERT INTO instance_events (instance_id, event_id, request, response) VALUES (?, ?, ?, ?)",
+                    (instance_id, event_id,
+                     json.dumps(normalized, separators=(",", ":"), sort_keys=True),
+                     json.dumps(response)),
+                )
+            self._db.commit()
+        return response
 
     def get(self, instance_id: str) -> dict[str, Any]:
         with self._lock:
@@ -332,6 +446,18 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                     event_id = body["eventId"] if "eventId" in body else _UNSET
                     return self._send(
                         200, engine.advance(parts[2], body.get("outcome"), body.get("detail"), event_id)
+                    )
+                if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "signals":
+                    body = self._read_json()
+                    if not isinstance(body, dict) or set(body) - {"event", "detail", "eventId"}:
+                        raise InvalidRequest(
+                            'body must be {"event": "<事件名>", "detail": ..., "eventId": "..."}'
+                        )
+                    if "event" not in body:
+                        raise InvalidRequest("event is required")
+                    event_id = body["eventId"] if "eventId" in body else _UNSET
+                    return self._send(
+                        200, engine.signal(parts[2], body["event"], body.get("detail"), event_id)
                     )
                 return self._send(404, {"error": {"code": "not_found"}})
             except SagaError as error:
