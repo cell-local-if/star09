@@ -2667,5 +2667,519 @@ class InstanceRevisionHttpTests(unittest.TestCase):
         self.assertEqual(headers.get("ETag"), '"4"')
 
 
+class OrderingValidationTests(unittest.TestCase):
+    """Shape validation of the optional partitionKey/sequence pair."""
+
+    def setUp(self) -> None:
+        self.engine = Engine()
+
+    def tearDown(self) -> None:
+        self.engine.close()
+
+    def _start(self) -> str:
+        return self.engine.start("order", {})["id"]
+
+    def test_valid_partition_key_boundaries(self) -> None:
+        for key in ("p", "x" * 100):
+            iid = self._start()
+            result = self.engine.advance(iid, "succeeded", event_id="e-1", ordering=(key, 1))
+            self.assertEqual(result["ordering"], {"partitionKey": key, "sequence": 1})
+
+    def test_invalid_partition_keys_are_400(self) -> None:
+        iid = self._start()
+        for bad in (None, "", "x" * 101, 123, 12.5, True, ["p"], {"p": 1}):
+            with self.assertRaises(InvalidRequest, msg=repr(bad)):
+                self.engine.advance(iid, "succeeded", event_id="e-1", ordering=(bad, 1))
+            with self.assertRaises(InvalidRequest, msg=repr(bad)):
+                self.engine.signal(iid, "go", event_id="s-1", ordering=(bad, 1))
+
+    def test_invalid_sequences_are_400(self) -> None:
+        iid = self._start()
+        for bad in (None, 0, -1, -100, 1.5, 2.0, "1", True, False, [1], {"n": 1}):
+            with self.assertRaises(InvalidRequest, msg=repr(bad)):
+                self.engine.advance(iid, "succeeded", event_id="e-1", ordering=("p", bad))
+            with self.assertRaises(InvalidRequest, msg=repr(bad)):
+                self.engine.signal(iid, "go", event_id="s-1", ordering=("p", bad))
+
+    def test_ordering_without_event_id_is_400(self) -> None:
+        iid = self._start()
+        with self.assertRaises(InvalidRequest):
+            self.engine.advance(iid, "succeeded", ordering=("p", 1))
+        with self.assertRaises(InvalidRequest):
+            self.engine.signal(iid, "go", ordering=("p", 1))
+
+    def test_invalid_ordering_writes_nothing(self) -> None:
+        iid = self._start()
+        for bad_ordering in (("", 1), ("p", 0), ("p", -2), ("p", 1.5), (None, 1)):
+            with self.assertRaises(InvalidRequest):
+                self.engine.advance(iid, "succeeded", event_id="e-1", ordering=bad_ordering)
+        self.assertEqual(
+            self.engine._db.execute("SELECT COUNT(*) FROM partition_cursors").fetchone()[0], 0
+        )
+        self.assertEqual(
+            self.engine._db.execute("SELECT COUNT(*) FROM instance_events").fetchone()[0], 0
+        )
+        self.assertEqual(self.engine.get(iid).revision, 1)
+        self.assertEqual(self.engine.audit(iid)["history"], [])
+
+
+class OrderingEngineTests(unittest.TestCase):
+    """Partition cursor: contiguous per (workflow, partitionKey), shared across
+    instances and across events/signals."""
+
+    def setUp(self) -> None:
+        self.engine = Engine()
+        self.engine.define("approval", _await_workflow())
+
+    def tearDown(self) -> None:
+        self.engine.close()
+
+    def _start(self, workflow: str = "order") -> str:
+        return self.engine.start(workflow, {})["id"]
+
+    def _cursor(self, workflow: str, key: str):
+        row = self.engine._db.execute(
+            "SELECT next_sequence FROM partition_cursors WHERE workflow = ? AND partition_key = ?",
+            (workflow, key),
+        ).fetchone()
+        return row[0] if row else None
+
+    def test_ordered_success_reports_ordering_and_bumps_revision(self) -> None:
+        iid = self._start()
+        first = self.engine.advance(iid, "succeeded", event_id="e-1", ordering=("p1", 1))
+        self.assertEqual(first["ordering"], {"partitionKey": "p1", "sequence": 1})
+        self.assertEqual(first.revision, 2)
+        second = self.engine.advance(iid, "succeeded", event_id="e-2", ordering=("p1", 2))
+        self.assertEqual(second["ordering"], {"partitionKey": "p1", "sequence": 2})
+        self.assertEqual(second.revision, 3)
+        self.assertEqual(self._cursor("order", "p1"), 3)
+
+    def test_first_sequence_must_be_1_then_contiguous(self) -> None:
+        iid = self._start()
+        # A fresh partition only accepts 1; gaps are not buffered.
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-1", ordering=("p", 2))
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-1", ordering=("p", 3))
+        # The rejections consumed nothing: 1 is still the expected sequence.
+        first = self.engine.advance(iid, "succeeded", event_id="e-1", ordering=("p", 1))
+        self.assertEqual(first["ordering"]["sequence"], 1)
+        # After 1, the next must be exactly 2 — neither a gap nor a stale number.
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-2", ordering=("p", 3))
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-2", ordering=("p", 1))
+        second = self.engine.advance(iid, "succeeded", event_id="e-2", ordering=("p", 2))
+        self.assertEqual(second["ordering"]["sequence"], 2)
+
+    def test_partition_shared_across_instances_and_kinds(self) -> None:
+        a = self._start("approval")
+        b = self._start("approval")
+        # Signal on instance A takes sequence 1 of partition "shared".
+        sig = self.engine.signal(a, "approved", event_id="s-1", ordering=("shared", 1))
+        self.assertEqual(sig["ordering"], {"partitionKey": "shared", "sequence": 1})
+        # A different instance of the same workflow draws the next number.
+        sig_b = self.engine.signal(b, "approved", event_id="s-2", ordering=("shared", 2))
+        self.assertEqual(sig_b["ordering"]["sequence"], 2)
+        # Events and signals share the one cursor.
+        evt = self.engine.advance(a, "succeeded", event_id="e-1", ordering=("shared", 3))
+        self.assertEqual(evt["ordering"]["sequence"], 3)
+        self.assertEqual(self._cursor("approval", "shared"), 4)
+
+    def test_partitions_isolated_by_key_and_by_workflow(self) -> None:
+        order_a = self._start("order")
+        approval_a = self._start("approval")
+        self.engine.advance(order_a, "succeeded", event_id="e-1", ordering=("p", 1))
+        # Same key on another workflow is an independent partition.
+        self.engine.signal(approval_a, "approved", event_id="s-1", ordering=("p", 1))
+        # Same workflow, different key is an independent partition.
+        self.engine.advance(order_a, "succeeded", event_id="e-2", ordering=("q", 1))
+        self.assertEqual(self._cursor("order", "p"), 2)
+        self.assertEqual(self._cursor("approval", "p"), 2)
+        self.assertEqual(self._cursor("order", "q"), 2)
+
+    def test_ordered_replay_returns_first_response_and_consumes_nothing(self) -> None:
+        iid = self._start()
+        first = self.engine.advance(iid, "succeeded", {"n": 1}, event_id="e-1", ordering=("p", 1))
+        replay = self.engine.advance(iid, "succeeded", {"n": 1}, event_id="e-1", ordering=("p", 1))
+        self.assertEqual(replay, first)
+        self.assertEqual(replay["ordering"], {"partitionKey": "p", "sequence": 1})
+        # Omitted detail equals the explicit null of the first call, ordering equal
+        # (fresh partition: the cursor of "p" is shared across instances).
+        iid2 = self._start()
+        third = self.engine.advance(iid2, "succeeded", None, event_id="e-9", ordering=("p2", 1))
+        replay2 = self.engine.advance(iid2, "succeeded", event_id="e-9", ordering=("p2", 1))
+        self.assertEqual(replay2, third)
+        # The cursor did not move for the replays: sequence 2 is still the next one.
+        self.assertEqual(self._cursor("order", "p"), 2)
+        second = self.engine.advance(iid, "succeeded", event_id="e-2", ordering=("p", 2))
+        self.assertEqual(second["ordering"]["sequence"], 2)
+        # Only one audit record per accepted call — replays append nothing.
+        self.assertEqual(len(self.engine.audit(iid)["history"]), 2)
+
+    def test_same_event_id_with_different_ordering_is_409(self) -> None:
+        iid = self._start()
+        self.engine.advance(iid, "succeeded", event_id="e-1", ordering=("p", 1))
+        # Same eventId, different sequence or different partition: conflict.
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-1", ordering=("p", 2))
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-1", ordering=("q", 1))
+        # Same eventId without the ordering fields is a different payload too.
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-1")
+        # Nothing was consumed: the partition still expects 2 and accepts it.
+        result = self.engine.advance(iid, "succeeded", event_id="e-2", ordering=("p", 2))
+        self.assertEqual(result["ordering"]["sequence"], 2)
+
+    def test_unordered_then_ordered_same_event_id_is_409(self) -> None:
+        iid = self._start()
+        self.engine.advance(iid, "succeeded", event_id="e-1")
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-1", ordering=("p", 1))
+        self.assertIsNone(self._cursor("order", "p"))
+
+    def test_sequence_mismatch_changes_nothing(self) -> None:
+        iid = self._start()
+        self.engine.advance(iid, "succeeded", event_id="e-1", ordering=("p", 1))
+        snapshot = self.engine.get(iid)
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-2", ordering=("p", 5))
+        current = self.engine.get(iid)
+        self.assertEqual(current["state"], snapshot["state"])
+        self.assertEqual(current.revision, snapshot.revision)
+        self.assertEqual([h["eventId"] for h in self.engine.audit(iid)["history"]], ["e-1"])
+        self.assertEqual(
+            self.engine._db.execute(
+                "SELECT event_id FROM instance_events WHERE instance_id = ?", (iid,)
+            ).fetchall(),
+            [("e-1",)],
+        )
+        self.assertEqual(self._cursor("order", "p"), 2)
+
+    def test_if_match_checked_before_sequence(self) -> None:
+        iid = self._start()
+        self.engine.advance(iid, "succeeded", event_id="e-1", ordering=("p", 1))  # revision 2
+        # Stale precondition with the correct sequence: rejected, cursor untouched.
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-2", if_match=1, ordering=("p", 2))
+        self.assertEqual(self._cursor("order", "p"), 2)
+        # Matching precondition plus wrong sequence: rejected as well.
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-2", if_match=2, ordering=("p", 9))
+        self.assertEqual(self._cursor("order", "p"), 2)
+        result = self.engine.advance(iid, "succeeded", event_id="e-2", if_match=2, ordering=("p", 2))
+        self.assertEqual(result["ordering"]["sequence"], 2)
+        self.assertEqual(result.revision, 3)
+
+    def test_replay_precedes_sequence_check(self) -> None:
+        iid = self._start()
+        first = self.engine.advance(iid, "succeeded", event_id="e-1", ordering=("p", 1))
+        self.engine.advance(iid, "succeeded", event_id="e-2", ordering=("p", 2))
+        # The cursor now expects 3, but a replay of e-1 (sequence 1) still returns
+        # the first response instead of a stale-sequence 409.
+        replay = self.engine.advance(iid, "succeeded", event_id="e-1", ordering=("p", 1))
+        self.assertEqual(replay, first)
+        self.assertEqual(replay.revision, 3)
+        self.assertEqual(self._cursor("order", "p"), 3)
+
+    def test_rejected_transition_does_not_consume_sequence(self) -> None:
+        iid = self._start()
+        self.engine.advance(iid, "failed", event_id="e-1", ordering=("p", 1))  # compensated
+        # Terminal instance: the transition is illegal even with the right sequence.
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-2", ordering=("p", 2))
+        # The cursor stayed at 2: another instance of the same workflow can claim it.
+        other = self._start()
+        result = self.engine.advance(other, "succeeded", event_id="e-9", ordering=("p", 2))
+        self.assertEqual(result["ordering"]["sequence"], 2)
+        # An invalid outcome with a valid sequence is a 400 and consumes nothing.
+        with self.assertRaises(InvalidRequest):
+            self.engine.advance(other, "bogus", event_id="e-10", ordering=("p", 3))
+        result = self.engine.advance(other, "succeeded", event_id="e-10", ordering=("p", 3))
+        self.assertEqual(result["ordering"]["sequence"], 3)
+
+    def test_ordered_signal_audit_records_ordering_fields(self) -> None:
+        iid = self._start("approval")
+        sig = self.engine.signal(iid, "approved", {"by": "boss"}, event_id="s-1", ordering=("p", 1))
+        history = self.engine.audit(iid)["history"]
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["kind"], "signal")
+        self.assertEqual(
+            history[0]["request"],
+            {"eventId": "s-1", "event": "approved", "detail": {"by": "boss"},
+             "partitionKey": "p", "sequence": 1},
+        )
+        self.assertEqual(history[0]["response"], sig)
+        self.assertEqual(history[0]["response"]["ordering"], {"partitionKey": "p", "sequence": 1})
+
+    def test_unordered_calls_create_no_partition_records(self) -> None:
+        iid = self._start("approval")
+        self.engine.signal(iid, "approved", event_id="s-1")
+        self.engine.advance(iid, "succeeded", event_id="e-1")
+        self.engine.signal(iid, "shipped")  # anonymous
+        self.assertEqual(
+            self.engine._db.execute("SELECT COUNT(*) FROM partition_cursors").fetchone()[0], 0
+        )
+        # Unordered responses carry no ordering field.
+        self.assertNotIn("ordering", self.engine.get(iid))
+
+    def test_concurrent_same_partition_same_sequence_one_winner(self) -> None:
+        iid = self._start()
+        barrier = threading.Barrier(2)
+        outcomes: list[str] = []
+        lock = threading.Lock()
+
+        def submit(event_id: str) -> None:
+            try:
+                barrier.wait()
+                self.engine.advance(iid, "succeeded", event_id=event_id, ordering=("p", 1))
+                with lock:
+                    outcomes.append("ok")
+            except InvalidTransition:
+                with lock:
+                    outcomes.append("conflict")
+            except Exception as exc:  # noqa: BLE001
+                with lock:
+                    outcomes.append(f"error:{exc!r}")
+
+        threads = [threading.Thread(target=submit, args=(f"e-{i}",)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(outcomes), ["conflict", "ok"])
+        self.assertEqual(self._cursor("order", "p"), 2)
+        self.assertEqual(self.engine.get(iid)["state"]["completed"], ["reserve-stock"])
+
+
+class OrderingPersistenceTests(unittest.TestCase):
+    """Cursors, ledger and audit stay consistent across reopen; legacy files."""
+
+    def setUp(self) -> None:
+        fd, self.path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+
+    def tearDown(self) -> None:
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+    def test_cursor_ledger_and_audit_consistent_across_reopen(self) -> None:
+        engine = Engine(self.path)
+        iid = engine.start("order", {})["id"]
+        first = engine.advance(iid, "succeeded", event_id="e-1", ordering=("p", 1))
+        engine.advance(iid, "succeeded", event_id="e-2", ordering=("p", 2))
+        engine.close()
+
+        engine = Engine(self.path)
+        try:
+            # The cursor survived: 2 is stale, 4 is a gap, 3 is next.
+            with self.assertRaises(InvalidTransition):
+                engine.advance(iid, "succeeded", event_id="e-3", ordering=("p", 2))
+            with self.assertRaises(InvalidTransition):
+                engine.advance(iid, "succeeded", event_id="e-3", ordering=("p", 4))
+            # The ordered replay survived too, verbatim with its ordering.
+            replay = engine.advance(iid, "succeeded", event_id="e-1", ordering=("p", 1))
+            self.assertEqual(replay, first)
+            self.assertEqual(replay["ordering"], {"partitionKey": "p", "sequence": 1})
+            # Audit kept the ordered request and response.
+            history = engine.audit(iid)["history"]
+            self.assertEqual([h["seq"] for h in history], [1, 2])
+            self.assertEqual(history[0]["request"]["partitionKey"], "p")
+            self.assertEqual(history[0]["request"]["sequence"], 1)
+            self.assertEqual(history[0]["response"]["ordering"],
+                             {"partitionKey": "p", "sequence": 1})
+            third = engine.advance(iid, "succeeded", event_id="e-3", ordering=("p", 3))
+            self.assertEqual(third["ordering"]["sequence"], 3)
+            self.assertEqual(third["state"]["status"], "completed")
+        finally:
+            engine.close()
+
+        engine = Engine(self.path)
+        try:
+            self.assertEqual(engine.get(iid)["state"]["status"], "completed")
+            with self.assertRaises(InvalidTransition):
+                engine.advance(iid, "succeeded", event_id="e-4", ordering=("p", 3))
+        finally:
+            engine.close()
+
+    def test_legacy_file_gets_cursor_table_and_starts_at_1(self) -> None:
+        legacy = sqlite3.connect(self.path)
+        legacy.execute(
+            "CREATE TABLE instances (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, state TEXT NOT NULL)"
+        )
+        state = initial_state(WORKFLOWS["order"], {})
+        state = apply_outcome(WORKFLOWS["order"], state, "succeeded")
+        legacy.execute("INSERT INTO instances VALUES (?, ?, ?)",
+                       ("legacy-id", "order", json.dumps(state)))
+        legacy.commit()
+        legacy.close()
+
+        engine = Engine(self.path)
+        try:
+            # Old records are not backfilled with ordering; a fresh partition
+            # still starts at sequence 1.
+            self.assertEqual(engine.audit("legacy-id")["history"], [])
+            with self.assertRaises(InvalidTransition):
+                engine.advance("legacy-id", "succeeded", event_id="n-1", ordering=("p", 2))
+            result = engine.advance("legacy-id", "succeeded", event_id="n-1", ordering=("p", 1))
+            self.assertEqual(result["ordering"], {"partitionKey": "p", "sequence": 1})
+            history = engine.audit("legacy-id")["history"]
+            self.assertEqual(len(history), 1)
+            self.assertEqual(history[0]["request"]["partitionKey"], "p")
+        finally:
+            engine.close()
+
+
+class OrderingHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from saga import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def call(self, method: str, path: str, body: dict | None = None, headers: dict | None = None):
+        data = None if body is None else json.dumps(body).encode()
+        hdrs = {"Content-Type": "application/json"}
+        if headers:
+            hdrs.update(headers)
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data,
+                                         method=method, headers=hdrs)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), response.headers
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), error.headers
+
+    def _start(self, workflow: str = "order") -> str:
+        status, body, _ = self.call("POST", f"/v1/workflows/{workflow}/instances", {})
+        self.assertEqual(status, 201)
+        return body["id"]
+
+    def test_ordered_event_end_to_end(self) -> None:
+        iid = self._start()
+        status, first, headers = self.call(
+            "POST", f"/v1/instances/{iid}/events",
+            {"outcome": "succeeded", "eventId": "e-1", "partitionKey": "p1", "sequence": 1})
+        self.assertEqual(status, 200)
+        self.assertEqual(first["ordering"], {"partitionKey": "p1", "sequence": 1})
+        self.assertEqual(headers.get("ETag"), '"2"')
+        # Replay returns the first response verbatim, ordering included.
+        status, replay, headers = self.call(
+            "POST", f"/v1/instances/{iid}/events",
+            {"outcome": "succeeded", "eventId": "e-1", "partitionKey": "p1", "sequence": 1})
+        self.assertEqual((status, replay), (200, first))
+        self.assertEqual(headers.get("ETag"), '"2"')
+        # Next contiguous sequence accepted; gap and stale numbers are 409.
+        status, body, _ = self.call(
+            "POST", f"/v1/instances/{iid}/events",
+            {"outcome": "succeeded", "eventId": "e-2", "partitionKey": "p1", "sequence": 3})
+        self.assertEqual((status, body["error"]["code"]), (409, "invalid_transition"))
+        status, body, _ = self.call(
+            "POST", f"/v1/instances/{iid}/events",
+            {"outcome": "succeeded", "eventId": "e-2", "partitionKey": "p1", "sequence": 1})
+        self.assertEqual((status, body["error"]["code"]), (409, "invalid_transition"))
+        status, second, headers = self.call(
+            "POST", f"/v1/instances/{iid}/events",
+            {"outcome": "succeeded", "eventId": "e-2", "partitionKey": "p1", "sequence": 2})
+        self.assertEqual(status, 200)
+        self.assertEqual(second["ordering"], {"partitionKey": "p1", "sequence": 2})
+        self.assertEqual(headers.get("ETag"), '"3"')
+        # Audit carries the ordering fields of both accepted calls.
+        status, audit, _ = self.call("GET", f"/v1/instances/{iid}/audit")
+        self.assertEqual(status, 200)
+        self.assertEqual([h["request"]["partitionKey"] for h in audit["history"]], ["p1", "p1"])
+        self.assertEqual([h["request"]["sequence"] for h in audit["history"]], [1, 2])
+        self.assertEqual(audit["history"][0]["response"], first)
+        self.assertEqual(audit["history"][1]["response"], second)
+
+    def test_ordered_signal_end_to_end(self) -> None:
+        self.call("PUT", "/v1/workflows/oflow", {"steps": [
+            {"name": "s1", "compensation": "c1", "await": {"event": "go"}},
+            {"name": "s2", "compensation": "c2"},
+        ]})
+        iid = self._start("oflow")
+        status, sig, _ = self.call(
+            "POST", f"/v1/instances/{iid}/signals",
+            {"event": "go", "eventId": "s-1", "partitionKey": "p", "sequence": 1})
+        self.assertEqual(status, 200)
+        self.assertEqual(sig["ordering"], {"partitionKey": "p", "sequence": 1})
+        # The following event draws the next number of the same partition.
+        status, evt, _ = self.call(
+            "POST", f"/v1/instances/{iid}/events",
+            {"outcome": "succeeded", "eventId": "e-1", "partitionKey": "p", "sequence": 2})
+        self.assertEqual(status, 200)
+        self.assertEqual(evt["ordering"], {"partitionKey": "p", "sequence": 2})
+        self.assertEqual(evt["state"]["status"], "completed")
+        # Signal replay after completion still returns the first response.
+        status, replay, _ = self.call(
+            "POST", f"/v1/instances/{iid}/signals",
+            {"event": "go", "eventId": "s-1", "partitionKey": "p", "sequence": 1})
+        self.assertEqual((status, replay), (200, sig))
+
+    def test_ordering_field_shape_errors_are_400(self) -> None:
+        iid = self._start()
+        bad_bodies = [
+            {"outcome": "succeeded", "eventId": "e-1", "partitionKey": "p"},          # missing sequence
+            {"outcome": "succeeded", "eventId": "e-1", "sequence": 1},                # missing partitionKey
+            {"outcome": "succeeded", "partitionKey": "p", "sequence": 1},             # missing eventId
+            {"outcome": "succeeded", "eventId": "e-1", "partitionKey": "", "sequence": 1},
+            {"outcome": "succeeded", "eventId": "e-1", "partitionKey": None, "sequence": 1},
+            {"outcome": "succeeded", "eventId": "e-1", "partitionKey": "x" * 101, "sequence": 1},
+            {"outcome": "succeeded", "eventId": "e-1", "partitionKey": 7, "sequence": 1},
+            {"outcome": "succeeded", "eventId": "e-1", "partitionKey": "p", "sequence": 0},
+            {"outcome": "succeeded", "eventId": "e-1", "partitionKey": "p", "sequence": -1},
+            {"outcome": "succeeded", "eventId": "e-1", "partitionKey": "p", "sequence": 1.5},
+            {"outcome": "succeeded", "eventId": "e-1", "partitionKey": "p", "sequence": "1"},
+            {"outcome": "succeeded", "eventId": "e-1", "partitionKey": "p", "sequence": True},
+            {"outcome": "succeeded", "eventId": "e-1", "partitionKey": "p", "sequence": None},
+        ]
+        for bad in bad_bodies:
+            status, body, _ = self.call("POST", f"/v1/instances/{iid}/events", bad)
+            self.assertEqual(status, 400, bad)
+            self.assertEqual(body["error"]["code"], "invalid_request", bad)
+        # Signal endpoint applies the same rules.
+        for bad in ({"event": "go", "eventId": "s-1", "partitionKey": "p"},
+                    {"event": "go", "partitionKey": "p", "sequence": 1},
+                    {"event": "go", "eventId": "s-1", "partitionKey": "p", "sequence": 0}):
+            status, body, _ = self.call("POST", f"/v1/instances/{iid}/signals", bad)
+            self.assertEqual(status, 400, bad)
+            self.assertEqual(body["error"]["code"], "invalid_request", bad)
+        # Nothing was consumed or written: sequence 1 is still the first one.
+        status, body, _ = self.call(
+            "POST", f"/v1/instances/{iid}/events",
+            {"outcome": "succeeded", "eventId": "e-1", "partitionKey": "p", "sequence": 1})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["ordering"]["sequence"], 1)
+
+    def test_unknown_instance_with_ordering_is_404(self) -> None:
+        status, body, _ = self.call(
+            "POST", "/v1/instances/missing/events",
+            {"outcome": "succeeded", "eventId": "e-1", "partitionKey": "p", "sequence": 1})
+        self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
+        status, body, _ = self.call(
+            "POST", "/v1/instances/missing/signals",
+            {"event": "go", "eventId": "s-1", "partitionKey": "p", "sequence": 1})
+        self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
+
+    def test_unordered_requests_keep_baseline_shape(self) -> None:
+        iid = self._start()
+        status, body, headers = self.call("POST", f"/v1/instances/{iid}/events",
+                                          {"outcome": "succeeded", "eventId": "e-1"})
+        self.assertEqual(status, 200)
+        self.assertNotIn("ordering", body)
+        self.assertEqual(headers.get("ETag"), '"2"')
+        status, audit, _ = self.call("GET", f"/v1/instances/{iid}/audit")
+        self.assertNotIn("partitionKey", audit["history"][0]["request"])
+        self.assertNotIn("sequence", audit["history"][0]["request"])
+        self.assertNotIn("ordering", audit["history"][0]["response"])
+
+
 if __name__ == "__main__":
     unittest.main()
