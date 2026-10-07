@@ -318,6 +318,34 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
   空页返回空 `history` 与 `nextSeq: null`。
 - 两种模式都是只读查询：不写状态、幂等账本、审计表或分区游标。
 
+### `GET /v1/instances/{id}/timeline`
+实例级只读**时间线**查询（无请求体）：把 `/audit` 的逐条记录投影为便于逐步查看状态变化的紧凑 JSON
+→ `200 {"id","workflow","workflowVersion","state","timeline":[...],"nextSeq": <int|null>}`，
+并带响应头 **`ETag: "<当前实例版本>"`**（与 `GET /v1/instances/{id}` 相同）；未知 id ⇒ `404 not_found`。
+- 时间线与 `/audit` 共用同一份审计记录：**`seq` 集合、升序排序与 `afterSeq` 游标完全一致**
+  （`seq > afterSeq` 起算，严格升序），只是逐条记录的投影形状不同。时间线**没有**无分页模式与 `kind` 过滤。
+- 顶层 `state` 为查询时的当前状态（与 `GET /v1/instances/{id}` 一致，仍含 `context`）；
+  `timeline` 每项只反映**该条记录发生时**的 `response.state`，不随当前状态改变。
+- **每项固定包含**：`seq`、`kind`、`eventId`、`request`、`status`、`step`、`index`、`attempt`、
+  `completed`、`compensated`、`waitingFor`、`deadlineAt`、`failure`；后九项从该条记录的
+  `response.state` 投影。`response.state` 中的其余字段（若有）在这些固定字段之后原样带上；
+  **不返回 `context`，也不返回完整 `response`**。`request` 与 `/audit` 的归一化请求一致
+  （有序调用仍含 `partitionKey`/`sequence`）。
+- **旧记录兼容（只投影、不补写历史）**：审计记录的 `response.state` 缺少 `attempt` 时该项显示 `1`，
+  缺少 `waitingFor`/`deadlineAt` 时分别显示 `null`；这些默认值只出现在时间线响应中，
+  **绝不回写**审计表或实例状态。
+- **查询参数**（均可选，不得重复、不得出现未知参数）：
+  - `limit`：**1–200** 的**无前导零**十进制整数字符串，默认 `50`；
+  - `afterSeq`：**非负**无前导零十进制整数字符串，默认 `0`，表示从 `seq` 大于该值的记录开始。
+- 参数重复、未知参数、空值、带前导零、布尔/小数写法、负数、`limit` 越界
+  ⇒ **`400 invalid_request`** 且不产生任何写入；**校验先于实例查找**，合法查询访问不存在实例
+  ⇒ **`404 not_found`**。
+- `nextSeq` 仅当本页之后**仍有记录**时取本页末项的 `seq`（作为下一页的 `afterSeq`），否则为 `null`；
+  空页（无历史或 `afterSeq` 越过末尾）返回空 `timeline` 与 `nextSeq: null`。
+- **只读**：不改变状态、实例版本、幂等账本、审计表或分区游标，也不影响任何既有接口的结果；
+  同一 SQLite 文件重开后时间线一致，重开后新接受的调用继续延续 `seq`。
+  工作流版本、幂等回放、补偿顺序、等待超时、迁移、恢复、If-Match 与分区顺序行为全部保持不变。
+
 ## 实例版本与 If-Match（显式并发控制）
 
 实例版本用于乐观并发抢占，避免客户端用旧观察结果覆盖已经接受的推进或迁移；它与“定义版本”
@@ -325,6 +353,7 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 
 - **版本起点**：每个实例从版本 **1** 开始。
 - **暴露方式**：`GET /v1/instances/{id}`、`GET /v1/instances/{id}/audit`、
+  `GET /v1/instances/{id}/timeline`、
   `GET /v1/instances/{id}/migration-plan` 与启动成功的 `201`
   都返回响应头 **`ETag: "<带双引号的十进制版本>"`**，例如 `ETag: "1"`；成功迁移与成功恢复的 `200`
   响应同样返回反映新实例版本的 `ETag`。

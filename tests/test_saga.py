@@ -1553,6 +1553,345 @@ class AuditPagingHttpTests(unittest.TestCase):
         self.assertEqual(body["error"]["code"], "not_found")
 
 
+class TimelineEngineTests(unittest.TestCase):
+    """Engine-level coverage of the read-only timeline projection."""
+
+    def setUp(self) -> None:
+        self.engine = Engine()
+        self.engine.define("approval", _await_workflow())
+
+    def tearDown(self) -> None:
+        self.engine.close()
+
+    def _mixed_history(self) -> str:
+        """Three accepted calls: seq 1 signal, seq 2 event, seq 3 signal."""
+        iid = self.engine.start("approval", {"customer": "c1"})["id"]
+        self.engine.signal(iid, "approved", event_id="s-1")      # seq 1: enter do
+        self.engine.advance(iid, "succeeded", event_id="e-2")    # seq 2: enter ship (waiting)
+        self.engine.signal(iid, "shipped", event_id="s-3")       # seq 3: complete
+        return iid
+
+    def test_empty_instance_has_empty_timeline_and_null_next_seq(self) -> None:
+        iid = self.engine.start("approval", {})["id"]
+        result = self.engine.timeline(iid)
+        self.assertEqual(set(result), {"id", "workflow", "workflowVersion",
+                                       "state", "timeline", "nextSeq"})
+        self.assertEqual(result["id"], iid)
+        self.assertEqual(result["workflow"], "approval")
+        self.assertEqual(result["workflowVersion"], 1)
+        self.assertEqual(result["timeline"], [])
+        self.assertIsNone(result["nextSeq"])
+        self.assertEqual(result.revision, 1)
+
+    def test_entries_project_response_state_without_context_or_response(self) -> None:
+        iid = self._mixed_history()
+        audit = self.engine.audit(iid)
+        result = self.engine.timeline(iid)
+        timeline = result["timeline"]
+        self.assertEqual([e["seq"] for e in timeline], [1, 2, 3])
+        self.assertEqual([e["kind"] for e in timeline], ["signal", "event", "signal"])
+        self.assertEqual([e["eventId"] for e in timeline], ["s-1", "e-2", "s-3"])
+        fixed = {"seq", "kind", "eventId", "request", "status", "step", "index",
+                 "attempt", "completed", "compensated", "waitingFor",
+                 "deadlineAt", "failure"}
+        for entry, record in zip(timeline, audit["history"]):
+            # Exactly the fixed keys (the fixture states carry no extras).
+            self.assertEqual(set(entry), fixed)
+            self.assertNotIn("response", entry)
+            self.assertNotIn("context", entry)
+            self.assertEqual(entry["request"], record["request"])
+            state = record["response"]["state"]
+            for key in ("status", "step", "index", "attempt", "completed",
+                        "compensated", "waitingFor", "deadlineAt", "failure"):
+                self.assertEqual(entry[key], state[key], key)
+
+    def test_entry_fields_walk_the_state_transitions(self) -> None:
+        iid = self._mixed_history()
+        timeline = self.engine.timeline(iid)["timeline"]
+        first, second, third = timeline
+        self.assertEqual((first["status"], first["step"], first["index"]),
+                         ("running", "do", 1))
+        self.assertEqual(first["completed"], ["ask"])
+        self.assertEqual(first["compensated"], [])
+        self.assertIsNone(first["waitingFor"])
+        self.assertIsNone(first["deadlineAt"])
+        self.assertIsNone(first["failure"])
+        self.assertEqual(second["step"], "ship")
+        self.assertEqual(second["index"], 2)
+        self.assertEqual(second["completed"], ["ask", "do"])
+        self.assertEqual(second["waitingFor"], "shipped")
+        self.assertIsNone(second["deadlineAt"])
+        self.assertEqual((third["status"], third["step"], third["index"]),
+                         ("completed", None, 2))
+        self.assertEqual(third["completed"], ["ask", "do", "ship"])
+        self.assertIsNone(third["waitingFor"])
+
+    def test_entries_reflect_history_not_current_state(self) -> None:
+        iid = self._mixed_history()
+        first_before = self.engine.timeline(iid)["timeline"][0]
+        # The completed instance rejects further events; even so, the recorded
+        # entries stay byte-for-byte the stored historical projection.
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded", event_id="e-late")
+        first_after = self.engine.timeline(iid)["timeline"][0]
+        self.assertEqual(first_before, first_after)
+
+    def test_limit_pages_with_next_seq_cursor_matching_audit(self) -> None:
+        iid = self._mixed_history()
+        page1 = self.engine.timeline(iid, limit="2")
+        self.assertEqual([e["seq"] for e in page1["timeline"]], [1, 2])
+        self.assertEqual(page1["nextSeq"], 2)
+        page2 = self.engine.timeline(iid, limit="2", after_seq=str(page1["nextSeq"]))
+        self.assertEqual([e["seq"] for e in page2["timeline"]], [3])
+        self.assertIsNone(page2["nextSeq"])
+        page3 = self.engine.timeline(iid, after_seq="3")
+        self.assertEqual(page3["timeline"], [])
+        self.assertIsNone(page3["nextSeq"])
+        # Seq set, ordering and cursor semantics are identical to /audit.
+        for params in ({"limit": "2"}, {"limit": "2", "after_seq": "1"},
+                       {"after_seq": "2"}, {"limit": "1"}):
+            audit = self.engine.audit(iid, **params)
+            tl = self.engine.timeline(iid, **params)
+            self.assertEqual([e["seq"] for e in tl["timeline"]],
+                             [h["seq"] for h in audit["history"]], params)
+            self.assertEqual(tl["nextSeq"], audit["nextSeq"], params)
+
+    def test_defaults_are_limit_50_after_seq_0(self) -> None:
+        iid = self._mixed_history()
+        result = self.engine.timeline(iid)
+        self.assertEqual([e["seq"] for e in result["timeline"]], [1, 2, 3])
+        self.assertIsNone(result["nextSeq"])
+        self.assertEqual(result, self.engine.timeline(iid, limit="50", after_seq="0"))
+
+    def test_limit_boundaries(self) -> None:
+        iid = self._mixed_history()
+        self.assertEqual(self.engine.timeline(iid, limit="1")["nextSeq"], 1)
+        self.assertEqual(self.engine.timeline(iid, limit="200")["nextSeq"], None)
+        for bad in ("0", "201", "01", "00", "", "1.5", "true", "abc", "-1"):
+            with self.subTest(limit=bad):
+                with self.assertRaises(InvalidRequest):
+                    self.engine.timeline(iid, limit=bad)
+
+    def test_invalid_after_seq(self) -> None:
+        iid = self._mixed_history()
+        for bad in ("-1", "00", "01", "1.0", "", "x", "true"):
+            with self.subTest(after_seq=bad):
+                with self.assertRaises(InvalidRequest):
+                    self.engine.timeline(iid, after_seq=bad)
+
+    def test_invalid_params_raise_before_instance_lookup(self) -> None:
+        for params in ({"limit": "0"}, {"limit": "201"}, {"limit": "01"},
+                       {"limit": ""}, {"limit": "1.5"}, {"limit": "true"},
+                       {"after_seq": "-1"}, {"after_seq": "00"}, {"after_seq": ""}):
+            with self.subTest(params=params):
+                with self.assertRaises(InvalidRequest):
+                    self.engine.timeline("no-such-instance", **params)
+
+    def test_valid_params_on_missing_instance_raise_not_found(self) -> None:
+        with self.assertRaises(InstanceNotFound):
+            self.engine.timeline("no-such-instance", limit="10", after_seq="0")
+
+    def test_query_is_read_only(self) -> None:
+        iid = self._mixed_history()
+        before = self.engine.audit(iid)
+        self.engine.timeline(iid, limit="1")
+        self.engine.timeline(iid, after_seq="1")
+        self.engine.timeline(iid, limit="200", after_seq="0")
+        after = self.engine.audit(iid)
+        self.assertEqual(before, after)
+        self.assertEqual(before.revision, after.revision)
+
+    def test_legacy_rows_missing_attempt_and_wait_fields_show_defaults_only(self) -> None:
+        # A stored audit row from an older build: response.state has context but
+        # no attempt/waitingFor/deadlineAt, plus an unknown forward-compat key.
+        iid = self.engine.start("approval", {})["id"]
+        legacy_state = {
+            "status": "running", "step": "ask", "index": 0,
+            "completed": [], "compensated": [],
+            "context": {"secret": "shh"}, "failure": None,
+            "custom": "kept",
+        }
+        legacy_response = {"id": iid, "workflow": "approval",
+                           "workflowVersion": 1, "state": legacy_state}
+        with self.engine._db:  # noqa: SLF001
+            self.engine._db.execute(  # noqa: SLF001
+                "INSERT INTO instance_audit (instance_id, seq, kind, event_id, request, response) "
+                "VALUES (?, 1, 'event', NULL, ?, ?)",
+                (iid, json.dumps({"eventId": None, "outcome": "succeeded", "detail": None},
+                                 separators=(",", ":"), sort_keys=True),
+                 json.dumps(legacy_response)),
+            )
+        result = self.engine.timeline(iid)
+        entry = result["timeline"][0]
+        self.assertEqual(entry["attempt"], 1)
+        self.assertIsNone(entry["waitingFor"])
+        self.assertIsNone(entry["deadlineAt"])
+        # context is suppressed; other unknown state fields survive projection.
+        self.assertNotIn("context", entry)
+        self.assertEqual(entry["custom"], "kept")
+        # The stored historical row was not rewritten.
+        stored = self.engine.audit(iid)["history"][0]["response"]["state"]
+        self.assertNotIn("attempt", stored)
+        self.assertNotIn("waitingFor", stored)
+        self.assertNotIn("deadlineAt", stored)
+        self.assertEqual(stored["context"], {"secret": "shh"})
+
+    def test_revision_reflects_current_instance_version(self) -> None:
+        iid = self._mixed_history()
+        result = self.engine.timeline(iid, limit="1")
+        self.assertEqual(result["state"]["status"], "completed")
+        self.assertEqual(result.revision, 4)  # start + three accepted calls
+
+
+class TimelinePersistenceTests(unittest.TestCase):
+    """The timeline is consistent after reopening the same SQLite file."""
+
+    def setUp(self) -> None:
+        fd, self.path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+
+    def tearDown(self) -> None:
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+    def test_timeline_consistent_across_reopen(self) -> None:
+        engine = Engine(self.path)
+        engine.define("approval", _await_workflow())
+        iid = engine.start("approval", {})["id"]
+        engine.signal(iid, "approved", event_id="s-1")
+        engine.advance(iid, "succeeded", event_id="e-2")
+        before = engine.timeline(iid, limit="1", after_seq="0")
+        engine.close()
+
+        engine = Engine(self.path)
+        try:
+            after = engine.timeline(iid, limit="1", after_seq="0")
+            self.assertEqual(before, after)
+            full = engine.timeline(iid)
+            self.assertEqual([e["seq"] for e in full["timeline"]], [1, 2])
+            engine.signal(iid, "shipped", event_id="s-3")
+            self.assertEqual(
+                [e["seq"] for e in engine.timeline(iid)["timeline"]], [1, 2, 3]
+            )
+        finally:
+            engine.close()
+
+
+class TimelineHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from saga import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def call(self, method: str, path: str, body: dict | None = None):
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def get_headers(self, path: str):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", method="GET")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, dict(response.headers), json.loads(response.read() or b"{}")
+
+    def _instance_with_history(self) -> str:
+        self.call("PUT", "/v1/workflows/timed", {"steps": [
+            {"name": "s1", "compensation": "c1", "await": {"event": "go"}},
+            {"name": "s2", "compensation": "c2"},
+        ]})
+        status, body = self.call("POST", "/v1/workflows/timed/instances", {"context": {"k": "v"}})
+        iid = body["id"]
+        self.call("POST", f"/v1/instances/{iid}/signals", {"event": "go", "eventId": "sig-1"})
+        self.call("POST", f"/v1/instances/{iid}/events", {"outcome": "succeeded"})
+        return iid
+
+    def test_timeline_end_to_end_with_etag(self) -> None:
+        iid = self._instance_with_history()
+        status, headers, page1 = self.get_headers(f"/v1/instances/{iid}/timeline?limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("ETag"), '"3"')
+        self.assertEqual(set(page1), {"id", "workflow", "workflowVersion",
+                                      "state", "timeline", "nextSeq"})
+        self.assertEqual([e["seq"] for e in page1["timeline"]], [1])
+        self.assertEqual(page1["nextSeq"], 1)
+        entry = page1["timeline"][0]
+        self.assertEqual(entry["kind"], "signal")
+        self.assertEqual(entry["eventId"], "sig-1")
+        self.assertEqual(entry["request"],
+                         {"eventId": "sig-1", "event": "go", "detail": None})
+        self.assertEqual(entry["status"], "running")
+        self.assertEqual(entry["step"], "s2")
+        self.assertNotIn("response", entry)
+        self.assertNotIn("context", entry)
+        status, page2 = self.call("GET", f"/v1/instances/{iid}/timeline?limit=1&afterSeq=1")
+        self.assertEqual(status, 200)
+        self.assertEqual([e["seq"] for e in page2["timeline"]], [2])
+        self.assertEqual(page2["timeline"][0]["kind"], "event")
+        self.assertIsNone(page2["timeline"][0]["eventId"])
+        self.assertIsNone(page2["nextSeq"])
+
+    def test_no_params_uses_defaults(self) -> None:
+        iid = self._instance_with_history()
+        status, body = self.call("GET", f"/v1/instances/{iid}/timeline")
+        self.assertEqual(status, 200)
+        self.assertEqual([e["seq"] for e in body["timeline"]], [1, 2])
+        self.assertIsNone(body["nextSeq"])
+
+    def test_empty_timeline(self) -> None:
+        self.call("PUT", "/v1/workflows/empty-wf", {"steps": [{"name": "s", "compensation": "c"}]})
+        _, body = self.call("POST", "/v1/workflows/empty-wf/instances", {})
+        status, result = self.call("GET", f"/v1/instances/{body['id']}/timeline")
+        self.assertEqual(status, 200)
+        self.assertEqual(result["timeline"], [])
+        self.assertIsNone(result["nextSeq"])
+
+    def test_invalid_query_params_are_400(self) -> None:
+        iid = self._instance_with_history()
+        bad_paths = [
+            f"/v1/instances/{iid}/timeline?limit=0",
+            f"/v1/instances/{iid}/timeline?limit=201",
+            f"/v1/instances/{iid}/timeline?limit=01",
+            f"/v1/instances/{iid}/timeline?limit=",
+            f"/v1/instances/{iid}/timeline?limit=1.5",
+            f"/v1/instances/{iid}/timeline?limit=true",
+            f"/v1/instances/{iid}/timeline?afterSeq=-1",
+            f"/v1/instances/{iid}/timeline?afterSeq=00",
+            f"/v1/instances/{iid}/timeline?afterSeq=1.0",
+            f"/v1/instances/{iid}/timeline?limit=1&limit=2",
+            f"/v1/instances/{iid}/timeline?kind=event",
+            f"/v1/instances/{iid}/timeline?bogus=1",
+        ]
+        for path in bad_paths:
+            with self.subTest(path=path):
+                status, body = self.call("GET", path)
+                self.assertEqual(status, 400)
+                self.assertEqual(body["error"]["code"], "invalid_request")
+        # The rejected queries changed nothing.
+        status, audit = self.call("GET", f"/v1/instances/{iid}/audit")
+        self.assertEqual([h["seq"] for h in audit["history"]], [1, 2])
+
+    def test_invalid_params_on_missing_instance_are_400_not_404(self) -> None:
+        status, body = self.call("GET", "/v1/instances/missing/timeline?limit=0")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "invalid_request")
+
+    def test_valid_params_on_missing_instance_are_404(self) -> None:
+        status, body = self.call("GET", "/v1/instances/missing/timeline?limit=10&afterSeq=0")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "not_found")
+
+
 class AwaitTimeoutDefinitionTests(unittest.TestCase):
     """Validation of the optional timeoutMs field on a step's await object."""
 
