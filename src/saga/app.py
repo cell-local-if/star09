@@ -13,6 +13,7 @@ import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 
 class SagaError(Exception):
@@ -790,6 +791,44 @@ class Engine:
             revision,
         )
 
+    def list_instances(self, workflow: str | None = None, status: str | None = None,
+                       after_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+        """Read-only keyset listing of instances in ascending id byte order.
+
+        Filters and ordering are pushed into one SQL query, so the result is
+        stable under concurrent writes: ``workflow`` is an exact name match,
+        ``status`` matches the JSON state's status field, and ``after_id`` is a
+        pure byte-order boundary (it need not name an existing instance).
+        ``limit`` rows are fetched and one extra row decides whether more
+        matches follow; the caller's cursor is the last returned id, or null.
+        Read-only: no state, ledger, audit or cursor is touched.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if workflow is not None:
+            clauses.append("workflow = ?")
+            params.append(workflow)
+        if status is not None:
+            clauses.append("json_extract(state, '$.status') = ?")
+            params.append(status)
+        if after_id is not None:
+            clauses.append("id > ?")
+            params.append(after_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT id, workflow, version, state FROM instances{where} "
+                "ORDER BY id ASC LIMIT ?",
+                (*params, limit + 1),
+            ).fetchall()
+        instances = [
+            {"id": instance_id, "workflow": name, "workflowVersion": version,
+             "state": _read_state(raw_state)}
+            for instance_id, name, version, raw_state in rows[:limit]
+        ]
+        next_cursor = instances[-1]["id"] if len(rows) > limit and instances else None
+        return {"instances": instances, "nextCursor": next_cursor}
+
     def migrate(self, instance_id: str, version: Any, if_match: int | None = None) -> dict[str, Any]:
         """Re-pin a running instance to another existing version of the same workflow.
 
@@ -937,6 +976,47 @@ class Engine:
         )
 
 
+def parse_instance_query(query: str) -> dict[str, Any]:
+    """Parse and validate the GET /v1/instances query string.
+
+    Only the four known keys are allowed, each at most once: ``workflow``
+    (non-empty, at most 100 characters), ``status`` (one of the four listable
+    statuses), ``afterId`` (non-empty, at most 200 characters) and ``limit``
+    (a leading-zero-free decimal integer in 1..100, default 50). A malformed
+    query, an unknown or repeated parameter, or an empty/overlong value is
+    ``400 invalid_request``.
+    """
+    values: dict[str, str] = {}
+    # keep_blank_values lets "workflow=" surface as an empty value (400);
+    # a trailing "&" is a mere separator and yields no pair, while a bare "="
+    # is an unknown empty parameter name (400).
+    for key, value in parse_qsl(query, keep_blank_values=True, strict_parsing=False):
+        if key not in ("workflow", "status", "afterId", "limit") or key in values:
+            raise InvalidRequest(f"unknown or repeated query parameter: {key!r}")
+        values[key] = value
+
+    workflow = values.get("workflow")
+    if workflow is not None and (not workflow or len(workflow) > 100):
+        raise InvalidRequest("workflow must be a non-empty string of at most 100 characters")
+    status = values.get("status")
+    if status is not None and status not in ("running", "completed", "compensated", "dead_lettered"):
+        raise InvalidRequest(
+            "status must be one of running, completed, compensated, dead_lettered"
+        )
+    after_id = values.get("afterId")
+    if after_id is not None and (not after_id or len(after_id) > 200):
+        raise InvalidRequest("afterId must be a non-empty string of at most 200 characters")
+    raw_limit = values.get("limit", "50")
+    if not raw_limit.isascii() or not raw_limit.isdigit() or (
+        len(raw_limit) > 1 and raw_limit[0] == "0"
+    ):
+        raise InvalidRequest("limit must be a decimal integer without leading zeros")
+    limit = int(raw_limit)
+    if not 1 <= limit <= 100:
+        raise InvalidRequest("limit must be between 1 and 100")
+    return {"workflow": workflow, "status": status, "afterId": after_id, "limit": limit}
+
+
 def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "saga/0.1"
@@ -987,6 +1067,13 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, {"workflows": engine.workflow_names()})
                 if len(parts) == 3 and parts[:2] == ["v1", "workflows"]:
                     return self._send(200, engine.workflow_info(parts[2]))
+                if parts == ["v1", "instances"]:
+                    query = parse_instance_query(urlsplit(self.path).query)
+                    return self._send(
+                        200,
+                        engine.list_instances(query["workflow"], query["status"],
+                                             query["afterId"], query["limit"]),
+                    )
                 if len(parts) == 3 and parts[:2] == ["v1", "instances"]:
                     return self._send(200, engine.get(parts[2]))
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "audit":
