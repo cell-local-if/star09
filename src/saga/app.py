@@ -945,6 +945,84 @@ class Engine:
             next_revision,
         )
 
+    def migration_plan(self, instance_id: str, target_version: Any) -> dict[str, Any]:
+        """Read-only migration preview: the plan ``migrate`` would follow, without
+        changing anything.
+
+        ``target_version`` is the raw query literal: a positive decimal integer
+        with no leading zeros. Shape validation runs *before* the instance
+        lookup, so an invalid query is 400 even for a missing instance; a valid
+        query on a missing instance is 404, as is an unknown target version.
+        Semantic incompatibility is not an error here — it is reported in the
+        200 plan via ``compatible``/``reason``.
+
+        The response carries the instance's current revision for ETag emission
+        exactly like :meth:`get`, and the query itself advances nothing: no
+        state, version, instance_version, ledger, audit or cursor writes, and
+        no compensation, retry or wait side effects. Only the instance row and
+        the immutable workflow versions are read.
+        """
+        if (not isinstance(target_version, str) or not target_version
+                or not target_version.isascii() or not target_version.isdigit()
+                or (len(target_version) > 1 and target_version[0] == "0")):
+            raise InvalidRequest(
+                "targetVersion must be a positive decimal integer without leading zeros"
+            )
+        version = int(target_version)
+        if version < 1:
+            raise InvalidRequest(
+                "targetVersion must be a positive decimal integer without leading zeros"
+            )
+        with self._lock:
+            row = self._db.execute(
+                "SELECT workflow, state, version, instance_version FROM instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
+            if row is None:
+                raise InstanceNotFound(f"no instance {instance_id}")
+            name, raw_state, current_version, raw_revision = row
+            revision = raw_revision if raw_revision is not None else 1
+            target = self.workflow(name, version)  # unknown target version -> NotFound
+            state = _read_state(raw_state)
+            current_steps = None
+            if current_version is not None:
+                current_steps = self.workflow(name, current_version)["steps"]
+        index = int(state["index"])
+        reason = self._migration_block_reason(state, current_steps, target["steps"], index)
+        return _RevisionedResponse(
+            {"id": instance_id, "workflow": name,
+             "currentVersion": current_version, "targetVersion": version,
+             "currentIndex": index, "state": state,
+             "currentSteps": current_steps, "targetSteps": target["steps"],
+             "compatible": reason is None, "reason": reason},
+            revision,
+        )
+
+    @staticmethod
+    def _migration_block_reason(state: dict[str, Any], current_steps: Any,
+                                target_steps: list[dict[str, Any]], index: int) -> str | None:
+        """The first reason a migration is blocked, or None when it is compatible.
+
+        Mirrors :meth:`_check_compatible` (same pinning, running-only and
+        entered-step immutability rules) but reports instead of raising, and
+        adds the two plan-only preconditions ahead of the step comparison:
+        the instance must be running and must have a recorded version (a
+        legacy NULL version has no pinned definition to compare against).
+        """
+        if state["status"] != "running":
+            return "instance_not_running"
+        if current_steps is None:
+            return "missing_recorded_version"
+        if len(current_steps) != len(target_steps):
+            return "step_count_changed"
+        for current, target in zip(current_steps, target_steps):
+            if current["name"] != target["name"]:
+                return "step_name_changed"
+        for position, (current, target) in enumerate(zip(current_steps, target_steps)):
+            if position <= index and current != target:
+                return "entered_step_changed"
+        return None
+
     def recover(self, instance_id: str, if_match: int | None = None,
                 now_ms: int | None = None) -> dict[str, Any]:
         """Explicitly recover a dead_lettered instance back to running.
@@ -1168,6 +1246,25 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                 "kind": params.get("kind"),
             }
 
+        def _migration_plan_query_args(self) -> dict[str, Any]:
+            """Query arguments for GET /v1/instances/{id}/migration-plan.
+
+            Only targetVersion is known; a repeated or unknown parameter is
+            400. The value is handed to the engine as a raw (percent-decoded)
+            string; shape validation happens there, before the instance
+            lookup.
+            """
+            query = self.path.partition("?")[2]
+            pairs = parse_qsl(query, keep_blank_values=True)
+            names = [name for name, _ in pairs]
+            if len(set(names)) != len(names):
+                raise InvalidRequest("query parameters must not be repeated")
+            unknown = sorted(set(names) - {"targetVersion"})
+            if unknown:
+                raise InvalidRequest(f"unknown query parameters: {unknown}")
+            params = dict(pairs)
+            return {"target_version": params.get("targetVersion")}
+
         def do_GET(self) -> None:  # noqa: N802
             try:
                 parts = self._parts()
@@ -1183,6 +1280,8 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, engine.get(parts[2]))
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "audit":
                     return self._send(200, engine.audit(parts[2], **self._audit_query_args()))
+                if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "migration-plan":
+                    return self._send(200, engine.migration_plan(parts[2], **self._migration_plan_query_args()))
                 return self._send(404, {"error": {"code": "not_found"}})
             except SagaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})

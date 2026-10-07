@@ -231,6 +231,32 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
   ⇒ `409 invalid_transition`；带了与当前实例版本不相等的 `If-Match` 同样 ⇒ `409 invalid_transition`。
   这些拒绝都不改状态、不加实例版本、不动账本与审计。
 
+### `GET /v1/instances/{id}/migration-plan?targetVersion=<version>`
+迁移**预览**（只读，无请求体）：在真正调用 `/migrate` 之前返回当前版本与目标版本的两份步骤定义、
+兼容性结论与首个不兼容原因 →
+`200 {"id","workflow","currentVersion","targetVersion","currentIndex","state","currentSteps","targetSteps","compatible","reason"}`，
+并带响应头 **`ETag: "<当前实例版本>"`**（与 `GET /v1/instances/{id}` 相同；查询本身不推进实例版本）。
+- **只读**：只读取实例行与不可变工作流版本，不改状态、定义版本、`instance_version`、幂等账本、
+  审计或分区游标，也不触发补偿、重试或等待判定；重复查询结果一致。
+- **查询参数**：只允许 `targetVersion`，且必须恰好出现一次，取值为**无前导零的正十进制整数**。
+  参数重复、出现未知参数、缺省、空值或不合此格式（前导零、`0`、负数、小数、非数字）
+  ⇒ `400 invalid_request`；**参数校验先于实例查找**（非法查询对不存在的实例同样返回 400）。
+- 实例不存在 ⇒ `404 not_found`；目标版本不存在 ⇒ `404 not_found`；
+  语义不兼容**不是错误**，仍以 `200` 返回计划（不使用 `409`）。
+- **响应字段**：`state` 与实例查询相同（含旧字段回填）；`currentSteps`/`targetSteps` 分别为
+  当前固定版本与目标版本的步骤定义；旧实例无记录版本时 `currentVersion` 为 `null`、
+  `currentSteps` 为 `null`（`targetSteps` 照常返回）。
+- **兼容判定**：仅当实例 `running`、已有 `currentVersion` 且迁移兼容规则全部满足时
+  `compatible` 为 `true` 且 `reason` 为 `null`；否则 `compatible` 为 `false`，
+  `reason` 取以下顺序中**首个**命中的条件：
+  1. `instance_not_running`：实例不是 `running`；
+  2. `missing_recorded_version`：实例尚无记录的定义版本；
+  3. `step_count_changed`：两版本步骤总数不同；
+  4. `step_name_changed`：总数相同但有序步骤名不同；
+  5. `entered_step_changed`：总数与名称一致，但任一**已进入**步骤（索引 0..currentIndex）
+     的定义不同。
+  与 `/migrate` 保持同一套语义：版本固定、仅运行中可迁移、已进入步骤不可变、未来步骤可安全变化。
+
 ### `POST /v1/instances/{id}/recover`
 显式恢复入口：把一个 **`dead_lettered`** 实例放回可推进状态。请求体**只允许空 JSON 对象 `{}`**
 （无 body、非 JSON、`null`、数组、含任何字段的对象均 ⇒ `400 invalid_request`），可带可选 **`If-Match`**
@@ -298,7 +324,8 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 （`workflowVersion`）完全独立，不改变工作流定义、状态转移、补偿顺序、幂等规则、迁移兼容规则和既有审计。
 
 - **版本起点**：每个实例从版本 **1** 开始。
-- **暴露方式**：`GET /v1/instances/{id}`、`GET /v1/instances/{id}/audit` 与启动成功的 `201`
+- **暴露方式**：`GET /v1/instances/{id}`、`GET /v1/instances/{id}/audit`、
+  `GET /v1/instances/{id}/migration-plan` 与启动成功的 `201`
   都返回响应头 **`ETag: "<带双引号的十进制版本>"`**，例如 `ETag: "1"`；成功迁移与成功恢复的 `200`
   响应同样返回反映新实例版本的 `ETag`。
 - **前置条件**：`POST /v1/instances/{id}/events`、`/signals`、`/migrate`、`/recover` 接受可选请求头
