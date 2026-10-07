@@ -34,8 +34,10 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
   无等待时 `waitingFor` 与 `deadlineAt` 均为 `null`（终态亦为 `null`）。
   旧状态缺少 `waitingFor`/`deadlineAt` 字段时按 `null` 读取。
 - **实例版本（乐观并发）**：每个实例从版本 **1** 开始；版本只在**真正改变实例**时加 1
-  （被接受的事件/信号推进状态机后 +1，成功迁移 +1；迁移仍逐字段保留迁移前 `state`，但版本照常 +1）。
-  非法事件、终态继续推进、等待期间提交普通结果、信号名不匹配、未到期的 `timed_out`、不兼容迁移
+  （被接受的事件/信号推进状态机后 +1，成功迁移 +1，成功恢复 +1；迁移仍逐字段保留迁移前 `state`，
+  恢复只复位 `status`/`failure`/`attempt` 与等待字段，但版本照常 +1）。
+  非法事件、终态继续推进、等待期间提交普通结果、信号名不匹配、未到期的 `timed_out`、不兼容迁移、
+  对非 `dead_lettered` 实例（含已恢复实例）的恢复
   均**不加版本**，状态、版本、幂等账本、审计都不变。
   版本随实例行持久化（`instances.instance_version` 列，旧文件自动 `ALTER TABLE` 补齐）；
   旧实例（无该列）按版本 **1** 读取，下一次真正变更后变为 **2**——不伪造历史变更次数。
@@ -87,7 +89,8 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
     `compensated` = 本步及之前所有**带补偿**的步骤名**逆序**。
 - `timed_out`：等待超时死信。仅当实例 `running`、当前步骤正在等待（`waitingFor` 非空）、
   `deadlineAt` 非空且已到期（当前时刻 ≥ `deadlineAt`）才接受：
-  - `status="dead_lettered"`（终态），`step`/`index` 保留超时位置，`completed`/`compensated` 不变；
+  - `status="dead_lettered"`（对普通事件、外部信号与版本迁移为终态；唯一例外是显式
+  `POST /v1/instances/{id}/recover`，见该节），`step`/`index` 保留超时位置，`completed`/`compensated` 不变；
   - `failure = {"step": <超时步骤名>, "reason": "timeout", "detail": <请求 detail>}`；
   - `waitingFor` 与 `deadlineAt` 清为 `null`。
   未到期限、当前步骤非等待、等待无 `timeoutMs`（`deadlineAt` 为 `null`）、实例已终态
@@ -210,6 +213,29 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
   ⇒ `409 invalid_transition`；带了与当前实例版本不相等的 `If-Match` 同样 ⇒ `409 invalid_transition`。
   这些拒绝都不改状态、不加实例版本、不动账本与审计。
 
+### `POST /v1/instances/{id}/recover`
+显式恢复入口：把一个 **`dead_lettered`** 实例放回可推进状态。请求体**只允许空 JSON 对象 `{}`**
+（无 body、非 JSON、`null`、数组、含任何字段的对象均 ⇒ `400 invalid_request`），可带可选 **`If-Match`**
+（规则与 `/events` 完全一致，格式非法 ⇒ `400 invalid_request`）→
+`200 {"id":..., "workflow":..., "workflowVersion":..., "state": {...}}`，成功响应带
+**`ETag: "<恢复后的实例版本>"`**（恢复是真正的实例变更，版本恰好 +1）。
+- 恢复只做最小复位：`status` 变为 `running`，`failure` 变为 `null`，`attempt` 重置为 `1`；
+  `id`、`workflow`、`workflowVersion`、`step`、`index`、`completed`、`compensated`、`context` 原样保留。
+  当前步骤有 `await` 时 `waitingFor` 设为对应事件名；该 `await` 带 `timeoutMs` 时按**恢复成功时刻**
+  重新加 `timeoutMs` 生成新的 `deadlineAt`，不带则 `deadlineAt` 为 `null`；当前步骤没有 `await` 时
+  `waitingFor` 与 `deadlineAt` 均为 `null`。
+- 恢复**不代替**后续事件或信号，也**不触发补偿**：不重放已完成步骤、不重算任何结果、
+  不重建分区分号、不改写既有幂等账本与审计历史；恢复后仍须由匹配信号或普通结果推进。
+  恢复**不写幂等账本、不追加审计记录**（审计仍只收录真正推进状态机的 `/events` 与 `/signals`），
+  账本与审计中已存的历史响应（含 `dead_lettered` 状态的 `timed_out` 记录）永不改写。
+- 实例不存在 ⇒ `404 not_found`；实例不是 `dead_lettered`（running/completed/compensated）
+  或对已恢复实例重复恢复 ⇒ **`409 invalid_transition`**，且不产生第二次变更；
+  携带的 `If-Match` 与当前实例版本不相等同样 ⇒ **`409 invalid_transition`**。
+  这些拒绝都不改 state、实例版本、幂等账本、分区分号与审计历史（错误响应不带 `ETag`）。
+- 恢复后的实例维持当前一切语义：普通事件、匹配信号、等待超时拒绝、重试耗尽补偿、版本迁移、
+  幂等回放与顺序门控行为不变；固定版本为 `NULL` 的旧实例在恢复成功时与普通推进一样补记当时最新版。
+  旧 SQLite 文件照常升级读取，缺失的旧状态字段继续按现有兼容规则回填；恢复及后续变更重开同一文件后一致。
+
 ### `GET /v1/instances/{id}/audit`
 实例级只读审计查询（无请求体）→ `200 {"id","workflow","workflowVersion","state","history":[...]}`，
 并带响应头 **`ETag: "<当前实例版本>"`**；未知 id ⇒ `404 not_found`。
@@ -238,8 +264,9 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 
 - **版本起点**：每个实例从版本 **1** 开始。
 - **暴露方式**：`GET /v1/instances/{id}`、`GET /v1/instances/{id}/audit` 与启动成功的 `201`
-  都返回响应头 **`ETag: "<带双引号的十进制版本>"`**，例如 `ETag: "1"`。
-- **前置条件**：`POST /v1/instances/{id}/events`、`/signals`、`/migrate` 接受可选请求头
+  都返回响应头 **`ETag: "<带双引号的十进制版本>"`**，例如 `ETag: "1"`；成功迁移与成功恢复的 `200`
+  响应同样返回反映新实例版本的 `ETag`。
+- **前置条件**：`POST /v1/instances/{id}/events`、`/signals`、`/migrate`、`/recover` 接受可选请求头
   **`If-Match`**，取值只能是一个带双引号的十进制版本（与 `ETag` 同形）。
   - 与**当前实例版本相等**才继续既有处理；不相等 ⇒ **`409 invalid_transition`**，
     且状态、实例版本、幂等账本、审计均不变（响应不带 `ETag`）。
@@ -247,9 +274,11 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
     无引号数字（`1`）、前导零（`"01"`）、负数/小数或任何其他非规定格式
     ⇒ **`400 invalid_request`**，也不产生任何写入。
   - **省略 `If-Match`** 时不增加任何拒绝条件：现有成功响应、状态字段、JSON 字段与错误码保持不变。
-- **版本递增**：只在真正改变实例时加 1——被接受的事件或信号推进状态机后 +1，成功迁移 +1；
-  迁移的 `state` 仍逐字段保留迁移前内容。非法事件、终态继续推进、等待期间提交普通结果、
-  信号名不匹配、未到期的 `timed_out`、不兼容迁移都不加版本；未知实例仍返回 `404 not_found`。
+- **版本递增**：只在真正改变实例时加 1——被接受的事件或信号推进状态机后 +1，成功迁移 +1，
+  成功恢复 +1；迁移的 `state` 仍逐字段保留迁移前内容，恢复则把实例复位回 `running` 并重置
+  `failure`/`attempt` 与等待字段。非法事件、终态继续推进、等待期间提交普通结果、
+  信号名不匹配、未到期的 `timed_out`、不兼容迁移、对非 `dead_lettered` 实例的恢复都不加版本；
+  未知实例仍返回 `404 not_found`。
 - **回放优先于前置条件**：相同 `eventId` 且载荷相同的回放先于 `If-Match` 判断——
   即使携带的版本已经过期，也返回**首次完整响应**（响应体为首次处理时的历史 `state`），
   且不改变版本、状态、账本或审计；该回放响应的 `ETag` 反映**当前**实例版本。

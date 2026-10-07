@@ -9,6 +9,7 @@ from .app import (  # noqa: F401
     NotFound,
     SagaError,
     apply_outcome,
+    apply_recover,
     apply_signal,
     initial_state,
     make_handler,
@@ -18,5 +19,5 @@ from .app import (  # noqa: F401
 )
 
 __all__ = ["WORKFLOWS", "Engine", "InstanceNotFound", "InvalidRequest", "InvalidTransition", "NotFound",
-           "SagaError", "apply_outcome", "apply_signal", "initial_state", "make_handler", "parse_if_match",
-           "serve", "validate_workflow"]
+           "SagaError", "apply_outcome", "apply_recover", "apply_signal", "initial_state",
+           "make_handler", "parse_if_match", "serve", "validate_workflow"]

@@ -291,6 +291,39 @@ def _apply_timed_out(workflow: dict[str, Any], state: dict[str, Any], detail: An
     return next_state
 
 
+def apply_recover(workflow: dict[str, Any], state: dict[str, Any],
+                  now_ms: int | None = None) -> dict[str, Any]:
+    """Pure transition: explicitly return a dead_lettered instance to running.
+
+    Recovery is the only transition a dead_lettered instance accepts, and it is
+    deliberately narrow:
+
+    * the instance keeps its position (step/index) and its completed,
+      compensated and context lists exactly as they were;
+    * failure clears, attempt resets to 1;
+    * the current step's wait is re-armed as if the step were freshly entered —
+      waitingFor carries the awaited event name, deadlineAt is rebuilt as of the
+      recovery moment when the await has timeoutMs, else null; a step without an
+      await waits for nothing (both null).
+
+    Nothing is replayed or compensated: completed steps are not re-run, and a
+    following event or signal is still required to move the instance on. Any
+    status other than dead_lettered is an invalid transition.
+    """
+    if state["status"] != "dead_lettered":
+        raise InvalidTransition(f"instance is {state['status']}, not dead_lettered")
+    steps = workflow["steps"]
+    index = int(state["index"])
+    next_state = json.loads(json.dumps(state))
+    next_state["status"] = "running"
+    next_state["failure"] = None
+    next_state["attempt"] = 1
+    waiting_for, deadline_at = _wait_fields(steps[index], now_ms)
+    next_state["waitingFor"] = waiting_for
+    next_state["deadlineAt"] = deadline_at
+    return next_state
+
+
 def _apply_succeeded(workflow: dict[str, Any], state: dict[str, Any],
                      now_ms: int | None = None) -> dict[str, Any]:
     """Complete the current step and advance (shared by succeeded outcomes and signals)."""
@@ -806,6 +839,55 @@ class Engine:
             next_revision,
         )
 
+    def recover(self, instance_id: str, if_match: int | None = None,
+                now_ms: int | None = None) -> dict[str, Any]:
+        """Explicitly recover a dead_lettered instance back to running.
+
+        Recovery neither replays completed steps nor runs compensation, and it
+        does not stand in for a later event or signal: it only re-arms the
+        current step's wait against the instance's pinned workflow definition.
+        Lookup, the If-Match precondition, the state-machine check, the state
+        write and the revision bump happen under one lock and in one
+        transaction. Rejections (unknown instance, stale precondition, any
+        status other than dead_lettered) write nothing: no state, no ledger
+        row, no audit record, no cursor change. A successful recovery is a real
+        instance change: the revision advances by exactly one, but it appends
+        neither ledger rows nor audit records — the accepted history keeps the
+        meaning it had before recovery.
+        """
+        with self._lock:
+            row = self._db.execute(
+                "SELECT workflow, state, version, instance_version FROM instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
+            if row is None:
+                raise InstanceNotFound(f"no instance {instance_id}")
+            name, raw_state, current_version, raw_revision = row
+            revision = raw_revision if raw_revision is not None else 1
+            if if_match is not None and if_match != revision:
+                raise InvalidTransition(f"instance version is {revision}, not {if_match}")
+            # Recovery runs against the pinned definition; a NULL legacy version
+            # resolves the latest one and is backfilled on this change, exactly
+            # like a normal advance would.
+            workflow = self.workflow(name, current_version)
+            version = current_version
+            if version is None:
+                version = self._db.execute(
+                    "SELECT MAX(version) FROM workflow_versions WHERE name = ?", (name,)
+                ).fetchone()[0]
+            state = _read_state(raw_state)
+            state = apply_recover(workflow, state, now_ms)
+            next_revision = revision + 1
+            self._db.execute(
+                "UPDATE instances SET state = ?, version = ?, instance_version = ? WHERE id = ?",
+                (json.dumps(state), version, next_revision, instance_id),
+            )
+            self._db.commit()
+        return _RevisionedResponse(
+            {"id": instance_id, "workflow": name, "workflowVersion": version, "state": state},
+            next_revision,
+        )
+
     @staticmethod
     def _check_compatible(current_steps: list[dict[str, Any]], target_steps: list[dict[str, Any]],
                           index: int) -> None:
@@ -942,6 +1024,13 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                     if not isinstance(body, dict) or set(body) - {"version"} or "version" not in body:
                         raise InvalidRequest('body must be {"version": <positive integer>}')
                     return self._send(200, engine.migrate(parts[2], body["version"], if_match))
+                if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "recover":
+                    body = self._read_json()
+                    if_match = parse_if_match(self.headers.get("If-Match"))
+                    # Recovery carries no payload: only an empty JSON object is accepted.
+                    if body != {}:
+                        raise InvalidRequest("body must be an empty JSON object {}")
+                    return self._send(200, engine.recover(parts[2], if_match))
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "events":
                     body = self._read_json()
                     if_match = parse_if_match(self.headers.get("If-Match"))

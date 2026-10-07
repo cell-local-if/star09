@@ -11,7 +11,7 @@ import unittest
 import urllib.error
 import urllib.request
 
-from saga import Engine, InstanceNotFound, InvalidRequest, InvalidTransition, NotFound, SagaError, WORKFLOWS, apply_outcome, apply_signal, initial_state, parse_if_match
+from saga import Engine, InstanceNotFound, InvalidRequest, InvalidTransition, NotFound, SagaError, WORKFLOWS, apply_outcome, apply_recover, apply_signal, initial_state, parse_if_match
 
 
 class TransitionUnitTests(unittest.TestCase):
@@ -3244,6 +3244,623 @@ class PartitionOrderingHttpTests(unittest.TestCase):
         self.assertEqual(audit["history"][1]["request"]["partitionKey"], "p")
         self.assertEqual(audit["history"][1]["response"]["ordering"],
                          {"partitionKey": "p", "sequence": 2})
+
+
+class RecoverTransitionTests(unittest.TestCase):
+    """Pure dead_lettered -> running recovery transition."""
+
+    def setUp(self) -> None:
+        self.workflow = _timeout_workflow()  # ask: await+timeout, do: plain, wait-forever: await no timeout
+
+    def _dead_lettered(self, now_ms: int = 1000) -> dict:
+        state = initial_state(self.workflow, {"customer": "c1"}, now_ms=now_ms)
+        return apply_outcome(self.workflow, state, "timed_out", {"why": "late"}, now_ms=6000)
+
+    def test_recover_re_arms_timeout_wait_and_resets_fields(self) -> None:
+        dead = self._dead_lettered()
+        recovered = apply_recover(self.workflow, dead, now_ms=7000)
+        self.assertEqual(recovered["status"], "running")
+        self.assertIsNone(recovered["failure"])
+        self.assertEqual(recovered["attempt"], 1)
+        # Position and progress are carried over exactly.
+        self.assertEqual((recovered["step"], recovered["index"]), ("ask", 0))
+        self.assertEqual(recovered["completed"], [])
+        self.assertEqual(recovered["compensated"], [])
+        self.assertEqual(recovered["context"], {"customer": "c1"})
+        # The wait is re-armed with a fresh deadline measured from the recovery moment.
+        self.assertEqual(recovered["waitingFor"], "approved")
+        self.assertEqual(recovered["deadlineAt"], 7000 + 5000)
+
+    def test_recover_does_not_mutate_input(self) -> None:
+        dead = self._dead_lettered()
+        apply_recover(self.workflow, dead, now_ms=7000)
+        self.assertEqual(dead["status"], "dead_lettered")
+        self.assertEqual(dead["failure"],
+                         {"step": "ask", "reason": "timeout", "detail": {"why": "late"}})
+        self.assertIsNone(dead["waitingFor"])
+        self.assertIsNone(dead["deadlineAt"])
+
+    def test_recover_after_progress_keeps_completed_and_awaits_without_timeout(self) -> None:
+        # Hand-build a dead-lettered instance later in the workflow: "ask"/"do" are
+        # already completed and the current step "wait-forever" awaits without timeoutMs.
+        state = initial_state(self.workflow, {}, now_ms=1000)
+        state = apply_signal(self.workflow, state, "approved", now_ms=2000)
+        state = apply_outcome(self.workflow, state, "succeeded", now_ms=3000)
+        self.assertEqual((state["step"], state["index"], state["waitingFor"]),
+                         ("wait-forever", 2, "never"))
+        state["status"] = "dead_lettered"
+        state["failure"] = {"step": "wait-forever", "reason": "timeout", "detail": None}
+        state["waitingFor"] = None
+        state["deadlineAt"] = None
+        recovered = apply_recover(self.workflow, state, now_ms=9000)
+        self.assertEqual((recovered["status"], recovered["step"], recovered["index"]),
+                         ("running", "wait-forever", 2))
+        self.assertEqual(recovered["completed"], ["ask", "do"])
+        self.assertEqual(recovered["attempt"], 1)
+        self.assertIsNone(recovered["failure"])
+        # An await without timeoutMs re-arms with a null deadline.
+        self.assertEqual(recovered["waitingFor"], "never")
+        self.assertIsNone(recovered["deadlineAt"])
+
+    def test_recover_dead_letter_on_plain_step_waits_for_nothing(self) -> None:
+        # Dead-lettering only happens via timeouts today, but recovery must still
+        # follow the current step's definition for any persisted dead_lettered row.
+        state = initial_state(self.workflow, {})
+        state = apply_signal(self.workflow, state, "approved")
+        self.assertEqual(state["step"], "do")  # plain step, no await
+        state["status"] = "dead_lettered"
+        state["failure"] = {"step": "do", "reason": "timeout", "detail": None}
+        recovered = apply_recover(self.workflow, state, now_ms=1000)
+        self.assertEqual(recovered["status"], "running")
+        self.assertIsNone(recovered["waitingFor"])
+        self.assertIsNone(recovered["deadlineAt"])
+        self.assertEqual((recovered["step"], recovered["index"]), ("do", 1))
+
+    def test_non_dead_states_are_409_and_untouched(self) -> None:
+        running = initial_state(self.workflow, {})
+        # The timeout workflow ends on an awaiting step, so build completed and
+        # compensated states with the built-in order workflow instead.
+        completed = initial_state(WORKFLOWS["order"], {})
+        for _ in range(3):
+            completed = apply_outcome(WORKFLOWS["order"], completed, "succeeded")
+        self.assertEqual(completed["status"], "completed")
+        compensated = apply_outcome(WORKFLOWS["order"],
+                                    initial_state(WORKFLOWS["order"], {}), "failed")
+        self.assertEqual(compensated["status"], "compensated")
+        for state, label in ((running, "running"), (completed, "completed"),
+                             (compensated, "compensated")):
+            snapshot = json.loads(json.dumps(state))
+            with self.assertRaises(InvalidTransition, msg=label):
+                apply_recover(self.workflow, state)
+            self.assertEqual(state, snapshot, label)
+
+    def test_repeated_recover_is_409(self) -> None:
+        recovered = apply_recover(self.workflow, self._dead_lettered(), now_ms=7000)
+        with self.assertRaises(InvalidTransition):
+            apply_recover(self.workflow, recovered, now_ms=8000)
+
+
+class RecoverEngineTests(unittest.TestCase):
+    """Engine-level recovery: revisioning, ledgers, audit, cursors and preconditions."""
+
+    def setUp(self) -> None:
+        self.engine = Engine()
+        # A plain first step and a timeout-awaiting second step, so progress is
+        # visible when the instance dead-letters mid-workflow.
+        self.engine.define("mid", {"steps": [
+            {"name": "a", "compensation": "undo-a"},
+            {"name": "b", "compensation": "undo-b",
+             "await": {"event": "go", "timeoutMs": 1}},
+        ]})
+
+    def tearDown(self) -> None:
+        self.engine.close()
+
+    def _dead(self, event_id: str = "t-1", advance_id: str = "e-0") -> str:
+        iid = self.engine.start("mid", {"k": "v"})["id"]
+        self.engine.advance(iid, "succeeded", event_id=advance_id)  # a -> b (waiting)
+        time.sleep(0.02)  # let the 1ms deadline pass
+        self.engine.advance(iid, "timed_out", {"why": "late"}, event_id=event_id)
+        return iid
+
+    def test_recover_re_arms_wait_bumps_revision_and_writes_no_history(self) -> None:
+        iid = self._dead()
+        dead = self.engine.get(iid)
+        self.assertEqual(dead["state"]["status"], "dead_lettered")
+        self.assertEqual(dead.revision, 3)
+        t0 = int(time.time() * 1000)
+        recovered = self.engine.recover(iid)
+        state = recovered["state"]
+        self.assertEqual(recovered["workflowVersion"], dead["workflowVersion"])
+        self.assertEqual(state["status"], "running")
+        self.assertIsNone(state["failure"])
+        self.assertEqual(state["attempt"], 1)
+        self.assertEqual((state["step"], state["index"]), ("b", 1))
+        self.assertEqual(state["completed"], ["a"])
+        self.assertEqual(state["context"], {"k": "v"})
+        self.assertEqual(state["waitingFor"], "go")
+        self.assertIsInstance(state["deadlineAt"], int)
+        self.assertGreaterEqual(state["deadlineAt"], t0 + 1)
+        self.assertEqual(recovered.revision, 4)
+        self.assertEqual(self.engine.get(iid).revision, 4)
+        # No ledger row and no audit record for the recovery.
+        self.assertEqual(
+            self.engine._db.execute(
+                "SELECT COUNT(*) FROM instance_events WHERE instance_id = ?", (iid,)
+            ).fetchone()[0],
+            2,
+        )
+        history = self.engine.audit(iid)["history"]
+        self.assertEqual([h["eventId"] for h in history], ["e-0", "t-1"])
+        self.assertEqual(history[-1]["response"]["state"]["status"], "dead_lettered")
+        self.assertEqual(
+            self.engine._db.execute("SELECT COUNT(*) FROM partition_cursors").fetchone()[0], 0
+        )
+
+    def test_recover_deadline_uses_injected_now(self) -> None:
+        iid = self._dead()
+        recovered = self.engine.recover(iid, now_ms=100_000)
+        self.assertEqual(recovered["state"]["deadlineAt"], 100_001)
+
+    def test_recovered_instance_continues_with_signal_then_normal_events(self) -> None:
+        iid = self._dead()
+        # Recover against an injected clock so the fresh 1ms deadline is still in
+        # the future when the immediate timed_out is attempted.
+        self.engine.recover(iid, now_ms=100_000)
+        # While re-waiting, ordinary events and an early timed_out stay refused.
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "succeeded")
+        with self.assertRaises(InvalidTransition):
+            apply_outcome(self.engine.workflow("mid"),
+                          self.engine.get(iid)["state"], "timed_out", now_ms=100_000)
+        result = self.engine.signal(iid, "go", event_id="s-1")  # b is the last step
+        self.assertEqual(result["state"]["status"], "completed")
+        self.assertEqual(result["state"]["completed"], ["a", "b"])
+        # The audit chain simply continues; the recovery inserted nothing.
+        history = self.engine.audit(iid)["history"]
+        self.assertEqual([h["seq"] for h in history], [1, 2, 3])
+        self.assertEqual([h["kind"] for h in history], ["event", "event", "signal"])
+
+    def test_can_dead_letter_recover_then_dead_letter_and_recover_again(self) -> None:
+        iid = self._dead()  # revision 3
+        first = self.engine.recover(iid)
+        self.assertEqual(first.revision, 4)
+        time.sleep(0.02)
+        again_dead = self.engine.advance(iid, "timed_out", {"why": "late-2"}, event_id="t-2")
+        self.assertEqual(again_dead["state"]["status"], "dead_lettered")
+        self.assertEqual(again_dead.revision, 5)
+        second = self.engine.recover(iid)
+        self.assertEqual(second["state"]["status"], "running")
+        self.assertEqual(second["state"]["waitingFor"], "go")
+        self.assertEqual(second.revision, 6)
+        self.assertEqual(self.engine.get(iid).revision, 6)
+        self.assertEqual([h["eventId"] for h in self.engine.audit(iid)["history"]],
+                         ["e-0", "t-1", "t-2"])
+
+    def test_recover_non_dead_states_is_409_without_a_second_change(self) -> None:
+        running = self.engine.start("mid", {})["id"]
+        with self.assertRaises(InvalidTransition):
+            self.engine.recover(running)
+        self.assertEqual(self.engine.get(running).revision, 1)
+        completed = self.engine.start("order", {})["id"]
+        for _ in range(3):
+            self.engine.advance(completed, "succeeded")
+        with self.assertRaises(InvalidTransition):
+            self.engine.recover(completed)
+        self.assertEqual(self.engine.get(completed)["state"]["status"], "completed")
+        compensated = self.engine.start("order", {})["id"]
+        self.engine.advance(compensated, "failed")
+        with self.assertRaises(InvalidTransition):
+            self.engine.recover(compensated)
+        # A recovered instance refuses a second recovery and changes nothing.
+        iid = self._dead()
+        self.engine.recover(iid)
+        snapshot = self.engine.get(iid)
+        with self.assertRaises(InvalidTransition):
+            self.engine.recover(iid)
+        current = self.engine.get(iid)
+        self.assertEqual(current["state"], snapshot["state"])
+        self.assertEqual(current.revision, snapshot.revision)
+
+    def test_recover_unknown_instance_is_404(self) -> None:
+        with self.assertRaises(InstanceNotFound):
+            self.engine.recover("missing")
+
+    def test_recover_if_match_matching_and_stale(self) -> None:
+        iid = self._dead()  # revision 3
+        with self.assertRaises(InvalidTransition):
+            self.engine.recover(iid, if_match=2)
+        self.assertEqual(self.engine.get(iid)["state"]["status"], "dead_lettered")
+        self.assertEqual(self.engine.get(iid).revision, 3)
+        recovered = self.engine.recover(iid, if_match=3)
+        self.assertEqual(recovered.revision, 4)
+
+    def test_timed_out_replay_after_recover_returns_historical_response(self) -> None:
+        iid = self._dead()
+        first = self.engine.advance(iid, "timed_out", {"why": "late"}, event_id="t-1")
+        self.assertEqual(first["state"]["status"], "dead_lettered")
+        self.engine.recover(iid)
+        # The historical ledger response is still replayed verbatim and does not
+        # move the now-running instance.
+        replay = self.engine.advance(iid, "timed_out", {"why": "late"}, event_id="t-1")
+        self.assertEqual(replay, first)
+        self.assertEqual(replay["state"]["status"], "dead_lettered")
+        self.assertEqual(self.engine.get(iid)["state"]["status"], "running")
+        # A different payload for the same eventId is still a conflict.
+        with self.assertRaises(InvalidTransition):
+            self.engine.advance(iid, "timed_out", {"why": "other"}, event_id="t-1")
+
+    def test_recover_preserves_compensated_list_and_does_not_compensate(self) -> None:
+        iid = self._dead()
+        # A dead-lettered row happens to carry a compensated list; recovery must
+        # leave it exactly as persisted and must not run or rebuild anything.
+        raw = self.engine._db.execute("SELECT state FROM instances WHERE id = ?", (iid,)).fetchone()[0]
+        state = json.loads(raw)
+        state["compensated"] = ["undo-b", "undo-a"]
+        self.engine._db.execute("UPDATE instances SET state = ? WHERE id = ?",
+                                (json.dumps(state), iid))
+        self.engine._db.commit()
+        recovered = self.engine.recover(iid)
+        self.assertEqual(recovered["state"]["compensated"], ["undo-b", "undo-a"])
+        self.assertEqual(recovered["state"]["completed"], ["a"])
+
+    def test_recover_does_not_rebuild_partition_cursor(self) -> None:
+        iid = self._dead()
+        # Replay the dead-letter as an ordered call? No: the dead-letter event was
+        # unordered. Open a partition by re-driving via an ordered retry is not
+        # possible, so instead order the signal after recovery: the cursor starts
+        # fresh at 1 and recovery must not have fabricated a row for it.
+        self.assertEqual(
+            self.engine._db.execute("SELECT COUNT(*) FROM partition_cursors").fetchone()[0], 0
+        )
+        self.engine.recover(iid)
+        self.assertEqual(
+            self.engine._db.execute("SELECT COUNT(*) FROM partition_cursors").fetchone()[0], 0
+        )
+        result = self.engine.signal(iid, "go", event_id="s-1", partition_key="p", sequence=1)
+        self.assertEqual(result["ordering"], {"partitionKey": "p", "sequence": 1})
+        # A gap is still refused: the cursor semantics are untouched.
+        with self.assertRaises(InvalidTransition):
+            self.engine.signal(iid, "go", event_id="s-2", partition_key="p", sequence=3)
+
+    def test_legacy_null_version_instance_backfills_on_recover(self) -> None:
+        fd, path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        try:
+            legacy = sqlite3.connect(path)
+            legacy.execute(
+                "CREATE TABLE instances (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, state TEXT NOT NULL)"
+            )
+            # A dead-lettered built-in order instance at its first (plain) step.
+            state = dict(initial_state(WORKFLOWS["order"], {"old": True}))
+            state["status"] = "dead_lettered"
+            state["failure"] = {"step": "reserve-stock", "reason": "timeout", "detail": None}
+            state["waitingFor"] = None
+            state["deadlineAt"] = None
+            legacy.execute("INSERT INTO instances VALUES (?, ?, ?)",
+                           ("legacy-id", "order", json.dumps(state)))
+            legacy.commit()
+            legacy.close()
+            engine = Engine(path)
+            try:
+                self.assertIsNone(engine.get("legacy-id")["workflowVersion"])
+                recovered = engine.recover("legacy-id")
+                self.assertEqual(recovered["workflowVersion"], 1)  # backfilled like an advance
+                self.assertEqual(recovered["state"]["status"], "running")
+                self.assertIsNone(recovered["state"]["waitingFor"])
+                self.assertIsNone(recovered["state"]["deadlineAt"])
+                self.assertEqual(recovered["state"]["context"], {"old": True})
+                self.assertEqual(recovered.revision, 2)
+                stored = engine._db.execute(
+                    "SELECT version, instance_version FROM instances WHERE id = ?", ("legacy-id",)
+                ).fetchone()
+                self.assertEqual(stored, (1, 2))
+                # The recovered legacy instance advances normally afterwards.
+                advanced = engine.advance("legacy-id", "succeeded", event_id="e-1")
+                self.assertEqual(advanced["state"]["completed"], ["reserve-stock"])
+            finally:
+                engine.close()
+        finally:
+            os.unlink(path)
+
+
+class RecoverPersistenceTests(unittest.TestCase):
+    """Recovery and the state it writes survive reopen; legacy rows stay readable."""
+
+    def setUp(self) -> None:
+        fd, self.path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+
+    def tearDown(self) -> None:
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+    @staticmethod
+    def _define(engine: Engine) -> None:
+        engine.define("mid", {"steps": [
+            {"name": "a", "compensation": "undo-a"},
+            {"name": "b", "await": {"event": "go", "timeoutMs": 1}},
+        ]})
+
+    def _dead(self, engine: Engine) -> str:
+        iid = engine.start("mid", {"k": "v"})["id"]
+        engine.advance(iid, "succeeded", event_id="e-0")
+        time.sleep(0.02)
+        engine.advance(iid, "timed_out", {"why": "late"}, event_id="t-1")
+        return iid
+
+    def test_recover_and_follow_up_changes_consistent_across_reopen(self) -> None:
+        engine = Engine(self.path)
+        self._define(engine)
+        iid = self._dead(engine)
+        first_deadline = engine.get(iid)["state"]["deadlineAt"]
+        self.assertIsNone(first_deadline)
+        recovered = engine.recover(iid)
+        deadline = recovered["state"]["deadlineAt"]
+        self.assertIsInstance(deadline, int)
+        engine.close()
+
+        engine = Engine(self.path)
+        try:
+            self._define(engine)
+            current = engine.get(iid)
+            self.assertEqual(current["state"]["status"], "running")
+            self.assertEqual(current["state"]["deadlineAt"], deadline)
+            self.assertEqual(current["state"]["failure"], None)
+            self.assertEqual(current["state"]["attempt"], 1)
+            self.assertEqual(current.revision, 4)
+            # The accepted history is unchanged by the recovery.
+            history = engine.audit(iid)["history"]
+            self.assertEqual([h["eventId"] for h in history], ["e-0", "t-1"])
+            # Historical replay still works; a new matching signal finishes it.
+            replayed = engine.advance(iid, "timed_out", {"why": "late"}, event_id="t-1")
+            self.assertEqual(replayed["state"]["status"], "dead_lettered")
+            time.sleep(0.02)  # the recovered deadline is 1ms out too
+            done = engine.signal(iid, "go", event_id="s-1")
+            self.assertEqual(done["state"]["status"], "completed")
+        finally:
+            engine.close()
+
+        engine = Engine(self.path)
+        try:
+            self._define(engine)
+            self.assertEqual(engine.get(iid)["state"]["status"], "completed")
+        finally:
+            engine.close()
+
+    def test_legacy_dead_state_missing_wait_fields_recovers(self) -> None:
+        legacy = sqlite3.connect(self.path)
+        legacy.execute(
+            "CREATE TABLE instances (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, state TEXT NOT NULL)"
+        )
+        state = initial_state(WORKFLOWS["order"], {})
+        state["status"] = "dead_lettered"
+        state["failure"] = {"step": "reserve-stock", "reason": "timeout", "detail": None}
+        del state["waitingFor"]
+        del state["deadlineAt"]
+        legacy.execute("INSERT INTO instances VALUES (?, ?, ?)",
+                       ("legacy-id", "order", json.dumps(state)))
+        legacy.commit()
+        legacy.close()
+
+        engine = Engine(self.path)
+        try:
+            current = engine.get("legacy-id")["state"]
+            self.assertIsNone(current["waitingFor"])
+            self.assertIsNone(current["deadlineAt"])
+            recovered = engine.recover("legacy-id")
+            self.assertEqual(recovered["state"]["status"], "running")
+            self.assertIsNone(recovered["state"]["waitingFor"])
+            self.assertIsNone(recovered["state"]["deadlineAt"])
+            # Back on a plain step: an ordinary event advances it.
+            result = engine.advance("legacy-id", "succeeded", event_id="e-1")
+            self.assertEqual(result["state"]["completed"], ["reserve-stock"])
+        finally:
+            engine.close()
+
+    def test_legacy_dead_state_on_awaiting_step_re_arms_with_new_definition(self) -> None:
+        legacy = sqlite3.connect(self.path)
+        legacy.execute(
+            "CREATE TABLE instances (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, state TEXT NOT NULL)"
+        )
+        state = {
+            "status": "dead_lettered", "step": "ask", "index": 0, "attempt": 4,
+            "completed": [], "compensated": [], "context": {},
+            "failure": {"step": "ask", "reason": "timeout", "detail": None},
+        }  # no waitingFor/deadlineAt fields at all
+        legacy.execute("INSERT INTO instances VALUES (?, ?, ?)",
+                       ("legacy-id", "expiring", json.dumps(state)))
+        legacy.commit()
+        legacy.close()
+
+        engine = Engine(self.path)
+        try:
+            engine.define("expiring", {"steps": [
+                {"name": "ask", "await": {"event": "go", "timeoutMs": 5000}},
+            ]})
+            t0 = int(time.time() * 1000)
+            recovered = engine.recover("legacy-id")
+            self.assertEqual(recovered["state"]["status"], "running")
+            self.assertEqual(recovered["state"]["attempt"], 1)
+            self.assertEqual(recovered["state"]["waitingFor"], "go")
+            self.assertIsInstance(recovered["state"]["deadlineAt"], int)
+            self.assertGreaterEqual(recovered["state"]["deadlineAt"], t0 + 5000)
+        finally:
+            engine.close()
+
+
+class RecoverHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from saga import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def call(self, method: str, path: str, body=b"", headers: dict | None = None):
+        if body == b"":
+            data = b""
+        else:
+            data = json.dumps(body).encode()
+        hdrs = {"Content-Type": "application/json"}
+        if headers:
+            hdrs.update(headers)
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data,
+                                         method=method, headers=hdrs)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), response.headers
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), error.headers
+
+    def _dead(self) -> str:
+        self.call("PUT", "/v1/workflows/rflow", {"steps": [
+            {"name": "s1", "compensation": "c1", "await": {"event": "go", "timeoutMs": 1}},
+            {"name": "s2", "compensation": "c2"},
+        ]})
+        status, body, _ = self.call("POST", "/v1/workflows/rflow/instances", {"context": {"k": "v"}})
+        self.assertEqual(status, 201)
+        iid = body["id"]
+        time.sleep(0.02)
+        status, body, _ = self.call("POST", f"/v1/instances/{iid}/events",
+                                    {"outcome": "timed_out", "detail": {"why": "late"},
+                                     "eventId": "t-1"})
+        self.assertEqual((status, body["state"]["status"]), (200, "dead_lettered"))
+        return iid
+
+    def test_recover_end_to_end(self) -> None:
+        iid = self._dead()
+        t0 = int(time.time() * 1000)
+        status, body, headers = self.call("POST", f"/v1/instances/{iid}/recover", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("ETag"), '"3"')  # 1 -> 2 (timed_out) -> 3 (recover)
+        self.assertEqual(set(body), {"id", "workflow", "workflowVersion", "state"})
+        self.assertEqual(body["workflow"], "rflow")
+        state = body["state"]
+        self.assertEqual(state["status"], "running")
+        self.assertIsNone(state["failure"])
+        self.assertEqual(state["attempt"], 1)
+        self.assertEqual((state["step"], state["index"]), ("s1", 0))
+        self.assertEqual(state["completed"], [])
+        self.assertEqual(state["compensated"], [])
+        self.assertEqual(state["context"], {"k": "v"})
+        self.assertEqual(state["waitingFor"], "go")
+        self.assertIsInstance(state["deadlineAt"], int)
+        self.assertGreaterEqual(state["deadlineAt"], t0 + 1)
+        # GET reflects the recovery and carries the new ETag.
+        status, current, headers = self.call("GET", f"/v1/instances/{iid}")
+        self.assertEqual(status, 200)
+        self.assertEqual(current["state"], state)
+        self.assertEqual(headers.get("ETag"), '"3"')
+        # Audit history still contains only the accepted timed_out call.
+        status, audit, _ = self.call("GET", f"/v1/instances/{iid}/audit")
+        self.assertEqual([h["eventId"] for h in audit["history"]], ["t-1"])
+        self.assertEqual(audit["history"][0]["response"]["state"]["status"], "dead_lettered")
+        # The re-armed wait blocks events but accepts the matching signal, then
+        # the plain second step completes via a normal event.
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/events",
+                                   {"outcome": "succeeded"})[0], 409)
+        status, body, _ = self.call("POST", f"/v1/instances/{iid}/signals", {"event": "go"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["state"]["completed"], ["s1"])
+        status, body, _ = self.call("POST", f"/v1/instances/{iid}/events",
+                                    {"outcome": "succeeded"})
+        self.assertEqual(body["state"]["status"], "completed")
+
+    def test_recover_rejections_and_no_second_change(self) -> None:
+        iid = self._dead()
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/recover", {})[0], 200)
+        # Repeated recovery is 409 and carries no ETag.
+        status, body, headers = self.call("POST", f"/v1/instances/{iid}/recover", {})
+        self.assertEqual((status, body["error"]["code"]), (409, "invalid_transition"))
+        self.assertIsNone(headers.get("ETag"))
+        # A running instance and a completed instance are 409 too.
+        running = self.call("POST", "/v1/workflows/order/instances", {})[1]["id"]
+        self.assertEqual(self.call("POST", f"/v1/instances/{running}/recover", {})[0], 409)
+        done = self.call("POST", "/v1/workflows/order/instances", {})[1]["id"]
+        for _ in range(3):
+            self.call("POST", f"/v1/instances/{done}/events", {"outcome": "succeeded"})
+        self.assertEqual(self.call("POST", f"/v1/instances/{done}/recover", {})[0], 409)
+        # Unknown instance is 404.
+        self.assertEqual(self.call("POST", "/v1/instances/missing/recover", {})[0], 404)
+        # The successfully recovered instance kept exactly one revision bump.
+        self.assertEqual(self.call("GET", f"/v1/instances/{iid}")[2].get("ETag"), '"3"')
+
+    def test_recover_requires_empty_object(self) -> None:
+        iid = self._dead()
+        raw_call = lambda raw: self._raw_post(f"/v1/instances/{iid}/recover", raw)
+        for raw, label in ((b"", "empty body"), (b"null", "null"), (b"[]", "array"),
+                           (b'{"x":1}', "field"), (b'{"detail":null}', "detail"),
+                           (b'"{}"', "string"), (b"42", "number"),
+                           (b"{not json}", "malformed")):
+            status, body, _ = raw_call(raw)
+            self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"), label)
+        # The rejections changed nothing: still dead_lettered at revision 2.
+        status, body, headers = self.call("GET", f"/v1/instances/{iid}")
+        self.assertEqual(body["state"]["status"], "dead_lettered")
+        self.assertEqual(headers.get("ETag"), '"2"')
+
+    def _raw_post(self, path: str, raw: bytes):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=raw,
+                                         method="POST",
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), response.headers
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), error.headers
+
+    def test_recover_if_match_validation_and_precondition(self) -> None:
+        iid = self._dead()  # revision 2
+        for raw in ("", "1", 'W/"1"', "*", '"01"', '"-1"'):
+            status, body, _ = self.call("POST", f"/v1/instances/{iid}/recover", {},
+                                        {"If-Match": raw})
+            self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"), repr(raw))
+        # Stale precondition: 409, no change.
+        status, body, headers = self.call("POST", f"/v1/instances/{iid}/recover", {},
+                                          {"If-Match": '"1"'})
+        self.assertEqual((status, body["error"]["code"]), (409, "invalid_transition"))
+        self.assertIsNone(headers.get("ETag"))
+        self.assertEqual(self.call("GET", f"/v1/instances/{iid}")[2].get("ETag"), '"2"')
+        # Matching precondition succeeds.
+        status, _, headers = self.call("POST", f"/v1/instances/{iid}/recover", {},
+                                       {"If-Match": '"2"'})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("ETag"), '"3"')
+
+    def test_recover_then_timeout_again_end_to_end(self) -> None:
+        # Dedicated workflow with a wider deadline: the initial wait is allowed to
+        # expire, yet the deadline re-armed by recovery is still comfortably in the
+        # future for an immediate timed_out.
+        self.call("PUT", "/v1/workflows/rflow2", {"steps": [
+            {"name": "s1", "await": {"event": "go", "timeoutMs": 200}},
+            {"name": "s2"},
+        ]})
+        iid = self.call("POST", "/v1/workflows/rflow2/instances", {})[1]["id"]
+        time.sleep(0.25)
+        status, body, _ = self.call("POST", f"/v1/instances/{iid}/events",
+                                    {"outcome": "timed_out", "eventId": "t-1"})
+        self.assertEqual((status, body["state"]["status"]), (200, "dead_lettered"))
+        status, _, headers = self.call("POST", f"/v1/instances/{iid}/recover", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("ETag"), '"3"')
+        # An immediate timed_out is refused: the fresh deadline has not passed.
+        status, body, _ = self.call("POST", f"/v1/instances/{iid}/events",
+                                    {"outcome": "timed_out"})
+        self.assertEqual((status, body["error"]["code"]), (409, "invalid_transition"))
+        time.sleep(0.25)
+        status, body, _ = self.call("POST", f"/v1/instances/{iid}/events",
+                                    {"outcome": "timed_out", "eventId": "t-2"})
+        self.assertEqual((status, body["state"]["status"]), (200, "dead_lettered"))
+        status, body, headers = self.call("POST", f"/v1/instances/{iid}/recover", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("ETag"), '"5"')
+        self.assertEqual(body["state"]["status"], "running")
 
 
 if __name__ == "__main__":
