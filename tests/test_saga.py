@@ -4295,5 +4295,346 @@ class ListInstancesHttpTests(unittest.TestCase):
         self.assertEqual(self.call("GET", "/v1/instances/x/y/z")[0], 404)
 
 
+class MigrationPlanEngineTests(unittest.TestCase):
+    """Read-only migration preview at the Engine level."""
+
+    def setUp(self) -> None:
+        self.engine = Engine()
+        self.engine.define("flow", _versioned_workflow())  # v1
+        self.v1_steps = _versioned_workflow()["steps"]
+
+    def tearDown(self) -> None:
+        self.engine.close()
+
+    def _define_v2(self) -> None:
+        # ask/do identical; only the not-yet-entered ship step changes.
+        self.engine.define("flow", {"steps": [
+            {"name": "ask", "compensation": "cancel-ask", "await": {"event": "approved"}},
+            {"name": "do", "compensation": "undo-do"},
+            {"name": "ship", "compensation": "abort-ship"},
+        ]})
+
+    def test_compatible_plan_shape(self) -> None:
+        self._define_v2()
+        iid = self.engine.start("flow", {}, version=1)["id"]
+        self.engine.signal(iid, "approved", event_id="s-1")  # now at index 1 ("do")
+        plan = self.engine.migration_plan(iid, 2)
+        self.assertEqual(plan.revision, 2)  # the signal bumped the instance to revision 2
+        self.assertEqual(
+            set(plan),
+            {"id", "workflow", "currentVersion", "targetVersion", "currentIndex", "state",
+             "currentSteps", "targetSteps", "compatible", "reason"},
+        )
+        self.assertEqual((plan["id"], plan["workflow"]), (iid, "flow"))
+        self.assertEqual((plan["currentVersion"], plan["targetVersion"]), (1, 2))
+        self.assertEqual(plan["currentIndex"], 1)
+        self.assertEqual(plan["currentSteps"], self.v1_steps)
+        self.assertEqual(plan["targetSteps"][2]["compensation"], "abort-ship")
+        self.assertTrue(plan["compatible"])
+        self.assertIsNone(plan["reason"])
+        self.assertEqual(plan["state"], self.engine.get(iid)["state"])
+
+    def test_targeting_the_current_version_is_compatible(self) -> None:
+        iid = self.engine.start("flow", {}, version=1)["id"]
+        plan = self.engine.migration_plan(iid, 1)
+        self.assertTrue(plan["compatible"])
+        self.assertIsNone(plan["reason"])
+        self.assertEqual(plan["currentSteps"], plan["targetSteps"])
+
+    def test_plan_is_read_only_and_matches_migrate_verdict(self) -> None:
+        self._define_v2()
+        iid = self.engine.start("flow", {}, version=1)["id"]
+        self.engine.signal(iid, "approved", event_id="s-1")
+        before = self.engine.get(iid)
+        history_before = len(self.engine.audit(iid)["history"])
+        for _ in range(2):
+            plan = self.engine.migration_plan(iid, 2)
+            self.assertTrue(plan["compatible"])
+            self.assertEqual(plan.revision, before.revision)
+        # Nothing moved: pinned version, revision, ledger/audit all unchanged.
+        current = self.engine.get(iid)
+        self.assertEqual(current["workflowVersion"], 1)
+        self.assertEqual(current.revision, before.revision)
+        self.assertEqual(current["state"], before["state"])
+        self.assertEqual(len(self.engine.audit(iid)["history"]), history_before)
+        # The preview's verdict agrees with the actual migrate acceptance.
+        migrated = self.engine.migrate(iid, 2)
+        self.assertEqual(migrated["workflowVersion"], 2)
+        self.assertEqual(migrated.revision, before.revision + 1)
+        # migrate itself appends no audit row either.
+        self.assertEqual(len(self.engine.audit(iid)["history"]), history_before)
+
+    def test_reasons_in_precedence_order(self) -> None:
+        iid = self.engine.start("flow", {}, version=1)["id"]
+        self.engine.signal(iid, "approved")  # index 1
+        # Different step count.
+        self.engine.define("flow", {"steps": [{"name": "ask"}, {"name": "do"}]})
+        plan = self.engine.migration_plan(iid, 2)
+        self.assertFalse(plan["compatible"])
+        self.assertEqual(plan["reason"], "step_count_changed")
+        # Same count, a renamed step.
+        self.engine.define("flow", {"steps": [{"name": "ask"}, {"name": "do"}, {"name": "deliver"}]})
+        self.assertEqual(self.engine.migration_plan(iid, 3)["reason"], "step_name_changed")
+        # Same count and names, an entered step (index 0, ask) changed.
+        self.engine.define("flow", {"steps": [
+            {"name": "ask", "compensation": "cancel-ask", "await": {"event": "ok"}},
+            {"name": "do", "compensation": "undo-do"},
+            {"name": "ship", "compensation": "cancel-ship"},
+        ]})
+        self.assertEqual(self.engine.migration_plan(iid, 4)["reason"], "entered_step_changed")
+        # Same count and names, the current entered step (index 1, do) changed.
+        self.engine.define("flow", {"steps": [
+            {"name": "ask", "compensation": "cancel-ask", "await": {"event": "approved"}},
+            {"name": "do", "compensation": "undo-do-differently"},
+            {"name": "ship", "compensation": "cancel-ship"},
+        ]})
+        self.assertEqual(self.engine.migration_plan(iid, 5)["reason"], "entered_step_changed")
+        # A change confined to a not-yet-entered step (ship) stays compatible.
+        self._define_v2()
+        plan = self.engine.migration_plan(iid, 6)
+        self.assertTrue(plan["compatible"])
+        self.assertIsNone(plan["reason"])
+        # Every preview left the instance pinned to v1.
+        self.assertEqual(self.engine.get(iid)["workflowVersion"], 1)
+
+    def test_entered_step_change_at_index_zero_is_incompatible(self) -> None:
+        # Instance still waiting at index 0; changing ask's await is entered-step drift.
+        self.engine.define("flow", {"steps": [
+            {"name": "ask", "compensation": "cancel-ask", "await": {"event": "ok"}},
+            {"name": "do", "compensation": "undo-do"},
+            {"name": "ship", "compensation": "cancel-ship"},
+        ]})
+        iid = self.engine.start("flow", {}, version=1)["id"]
+        plan = self.engine.migration_plan(iid, 2)
+        self.assertEqual((plan["currentIndex"], plan["reason"]), (0, "entered_step_changed"))
+        # While only the future ship step differs, even index 0 plans compatible.
+        self._define_v2()
+        plan = self.engine.migration_plan(iid, 3)
+        self.assertTrue(plan["compatible"])
+
+    def test_not_running_reason_takes_precedence(self) -> None:
+        self._define_v2()
+        iid = self.engine.start("flow", {}, version=1)["id"]
+        self.engine.signal(iid, "approved")
+        self.engine.advance(iid, "succeeded")
+        self.engine.advance(iid, "failed")  # compensated: terminal
+        # An incompatible target does not matter; the status reason wins.
+        self.engine.define("flow", {"steps": [{"name": "only"}]})
+        plan = self.engine.migration_plan(iid, 3)
+        self.assertEqual(plan["reason"], "instance_not_running")
+        self.assertFalse(plan["compatible"])
+        self.assertEqual(plan["state"]["status"], "compensated")
+
+    def test_legacy_instance_without_recorded_version(self) -> None:
+        fd, path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        try:
+            legacy = sqlite3.connect(path)
+            legacy.execute(
+                "CREATE TABLE instances (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, state TEXT NOT NULL)"
+            )
+            state = initial_state(WORKFLOWS["order"], {})
+            legacy.execute("INSERT INTO instances VALUES (?, ?, ?)",
+                           ("legacy-id", "order", json.dumps(state)))
+            legacy.commit()
+            legacy.close()
+            engine = Engine(path)
+            try:
+                engine.define("order", {"steps": [
+                    {"name": "reserve-stock", "compensation": "release-stock"},
+                    {"name": "charge-payment", "compensation": "refund-payment"},
+                    {"name": "create-shipment", "compensation": "cancel-shipment"},
+                ]})
+                plan = engine.migration_plan("legacy-id", 2)
+                self.assertIsNone(plan["currentVersion"])
+                self.assertIsNone(plan["currentSteps"])
+                self.assertEqual(plan["targetVersion"], 2)
+                self.assertIsNotNone(plan["targetSteps"])
+                self.assertEqual(plan["reason"], "missing_recorded_version")
+                self.assertFalse(plan["compatible"])
+                self.assertEqual(plan.revision, 1)
+                # Read-only: the version column is still NULL after the preview.
+                stored = engine._db.execute(
+                    "SELECT version, instance_version FROM instances WHERE id = ?",
+                    ("legacy-id",),
+                ).fetchone()
+                self.assertEqual(stored, (None, None))
+            finally:
+                engine.close()
+        finally:
+            os.unlink(path)
+
+    def test_not_running_beats_missing_recorded_version(self) -> None:
+        fd, path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        try:
+            legacy = sqlite3.connect(path)
+            legacy.execute(
+                "CREATE TABLE instances (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, state TEXT NOT NULL)"
+            )
+            state = initial_state(WORKFLOWS["order"], {})
+            state["status"] = "completed"
+            state["step"] = None
+            legacy.execute("INSERT INTO instances VALUES (?, ?, ?)",
+                           ("legacy-done", "order", json.dumps(state)))
+            legacy.commit()
+            legacy.close()
+            engine = Engine(path)
+            try:
+                plan = engine.migration_plan("legacy-done", 1)
+                self.assertEqual(plan["reason"], "instance_not_running")
+                self.assertIsNone(plan["currentVersion"])
+                self.assertIsNone(plan["currentSteps"])
+            finally:
+                engine.close()
+        finally:
+            os.unlink(path)
+
+    def test_unknown_instance_and_version_and_bad_shapes(self) -> None:
+        with self.assertRaises(InstanceNotFound):
+            self.engine.migration_plan("missing", 1)
+        iid = self.engine.start("flow", {})["id"]
+        with self.assertRaises(NotFound):
+            self.engine.migration_plan(iid, 99)
+        for bad in (None, 0, -1, 1.5, "2", True):
+            with self.assertRaises(InvalidRequest, msg=repr(bad)):
+                self.engine.migration_plan(iid, bad)
+
+
+class MigrationPlanHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from saga import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def call(self, method: str, path: str, body: dict | None = None):
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), response.headers
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), error.headers
+
+    def _versions(self, name: str) -> None:
+        self.call("PUT", f"/v1/workflows/{name}", {"steps": [
+            {"name": "s1", "compensation": "c1"},
+            {"name": "s2", "compensation": "c2"},
+        ]})
+        # v2: only the not-yet-entered s2 changes its compensation.
+        self.call("PUT", f"/v1/workflows/{name}", {"steps": [
+            {"name": "s1", "compensation": "c1"},
+            {"name": "s2", "compensation": "c2-new"},
+        ]})
+        # v3: renamed second step -> incompatible.
+        self.call("PUT", f"/v1/workflows/{name}", {"steps": [
+            {"name": "s1", "compensation": "c1"},
+            {"name": "s3", "compensation": "c2"},
+        ]})
+
+    def test_compatible_plan_end_to_end_with_etag(self) -> None:
+        self._versions("mp")
+        iid = self.call("POST", "/v1/workflows/mp/instances", {"version": 1})[1]["id"]
+        _, get_body, get_headers = self.call("GET", f"/v1/instances/{iid}")
+        status, plan, headers = self.call("GET", f"/v1/instances/{iid}/migration-plan?targetVersion=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("ETag"), get_headers.get("ETag"))
+        self.assertEqual(headers.get("ETag"), '"1"')
+        self.assertEqual(
+            set(plan),
+            {"id", "workflow", "currentVersion", "targetVersion", "currentIndex", "state",
+             "currentSteps", "targetSteps", "compatible", "reason"},
+        )
+        self.assertEqual(plan["id"], iid)
+        self.assertEqual((plan["workflow"], plan["currentVersion"], plan["targetVersion"]),
+                         ("mp", 1, 2))
+        self.assertEqual(plan["currentIndex"], 0)
+        self.assertEqual(plan["state"], get_body["state"])
+        self.assertEqual(plan["currentSteps"][1], {"name": "s2", "compensation": "c2"})
+        self.assertEqual(plan["targetSteps"][1], {"name": "s2", "compensation": "c2-new"})
+        self.assertTrue(plan["compatible"])
+        self.assertIsNone(plan["reason"])
+
+    def test_incompatible_plan_is_200_with_reason(self) -> None:
+        self._versions("mpi")
+        iid = self.call("POST", "/v1/workflows/mpi/instances", {"version": 1})[1]["id"]
+        status, plan, _ = self.call("GET", f"/v1/instances/{iid}/migration-plan?targetVersion=3")
+        self.assertEqual(status, 200)  # never a 409
+        self.assertFalse(plan["compatible"])
+        self.assertEqual(plan["reason"], "step_name_changed")
+        # Even the 400-style 409 the POST endpoint returns does not appear here.
+        self.assertNotIn("error", plan)
+
+    def test_terminal_instance_plans_instance_not_running(self) -> None:
+        iid = self.call("POST", "/v1/workflows/order/instances", {})[1]["id"]
+        self.call("POST", f"/v1/instances/{iid}/events", {"outcome": "failed"})
+        status, plan, _ = self.call("GET", f"/v1/instances/{iid}/migration-plan?targetVersion=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(plan["reason"], "instance_not_running")
+        self.assertFalse(plan["compatible"])
+
+    def test_unknown_instance_and_version_are_404(self) -> None:
+        status, body, _ = self.call("GET", "/v1/instances/missing/migration-plan?targetVersion=1")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "not_found")
+        iid = self.call("POST", "/v1/workflows/order/instances", {})[1]["id"]
+        status, body, _ = self.call("GET", f"/v1/instances/{iid}/migration-plan?targetVersion=99")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "not_found")
+
+    def test_bad_query_shapes_are_400_before_instance_lookup(self) -> None:
+        iid = self.call("POST", "/v1/workflows/order/instances", {})[1]["id"]
+        bad_paths = [
+            f"/v1/instances/{iid}/migration-plan",                       # missing
+            f"/v1/instances/{iid}/migration-plan?targetVersion=",        # empty
+            f"/v1/instances/{iid}/migration-plan?targetVersion=0",
+            f"/v1/instances/{iid}/migration-plan?targetVersion=01",
+            f"/v1/instances/{iid}/migration-plan?targetVersion=007",
+            f"/v1/instances/{iid}/migration-plan?targetVersion=-1",
+            f"/v1/instances/{iid}/migration-plan?targetVersion=1.5",
+            f"/v1/instances/{iid}/migration-plan?targetVersion=abc",
+            f"/v1/instances/{iid}/migration-plan?targetVersion=1%20",    # trailing space
+            f"/v1/instances/{iid}/migration-plan?targetVersion=1&targetVersion=2",  # repeated
+            f"/v1/instances/{iid}/migration-plan?targetVersion=1&bogus=2",          # unknown
+            f"/v1/instances/{iid}/migration-plan?bogus=1",                           # only unknown
+        ]
+        for path in bad_paths:
+            status, body, _ = self.call("GET", path)
+            self.assertEqual(status, 400, path)
+            self.assertEqual(body["error"]["code"], "invalid_request", path)
+        # Validation precedes the instance lookup: a bad query on a missing
+        # instance is 400, a well-formed one is 404.
+        status, _, _ = self.call("GET", "/v1/instances/missing/migration-plan?targetVersion=01")
+        self.assertEqual(status, 400)
+        status, _, _ = self.call("GET", "/v1/instances/missing/migration-plan?targetVersion=1")
+        self.assertEqual(status, 404)
+
+    def test_plan_does_not_advance_version_or_trigger_side_effects(self) -> None:
+        self._versions("mpro")
+        iid = self.call("POST", "/v1/workflows/mpro/instances", {"version": 1})[1]["id"]
+        etag_before = self.call("GET", f"/v1/instances/{iid}")[2].get("ETag")
+        for _ in range(3):
+            status, plan, headers = self.call(
+                "GET", f"/v1/instances/{iid}/migration-plan?targetVersion=2")
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get("ETag"), etag_before)
+            self.assertTrue(plan["compatible"])
+        etag_after = self.call("GET", f"/v1/instances/{iid}")[2].get("ETag")
+        self.assertEqual(etag_after, etag_before)
+        # Still pinned to v1; nothing was audited by the previews.
+        _, instance, _ = self.call("GET", f"/v1/instances/{iid}")
+        self.assertEqual(instance["workflowVersion"], 1)
+        _, audit, _ = self.call("GET", f"/v1/instances/{iid}/audit")
+        self.assertEqual(audit["history"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

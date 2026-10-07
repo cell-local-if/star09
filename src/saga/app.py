@@ -130,6 +130,20 @@ def _parse_audit_after_seq(raw: Any) -> int:
     return int(raw)
 
 
+def _parse_migration_target(raw: Any) -> int:
+    """targetVersion query literal for a migration plan: exactly one positive
+    decimal integer without leading zeros, carried as a raw query string.
+    Missing, empty, zero/negative, leading-zero, decimal-point or non-ASCII
+    forms are all 400."""
+    if (not isinstance(raw, str) or not raw or not raw.isascii()
+            or not raw.isdigit() or (len(raw) > 1 and raw[0] == "0")
+            or int(raw) < 1):
+        raise InvalidRequest(
+            "targetVersion must be a positive decimal integer without leading zeros"
+        )
+    return int(raw)
+
+
 def _validate_ordering(partition_key: Any, sequence: Any, has_event_id: bool) -> tuple[str | None, int | None]:
     """Validate the optional ``(partitionKey, sequence)`` ordering pair.
 
@@ -945,6 +959,60 @@ class Engine:
             next_revision,
         )
 
+    def migration_plan(self, instance_id: str, version: Any) -> dict[str, Any]:
+        """Read-only preview of re-pinning an instance to *version*.
+
+        Returns the current and target step definitions alongside the same
+        compatibility verdict :meth:`migrate` enforces, without applying
+        anything: no state write, no version or instance_version change, no
+        ledger, audit, partition-cursor, compensation, retry or wait side
+        effect. Incompatibility is reported in the body (``compatible`` false
+        with a ``reason``), never as a 409 — only an unknown instance and an
+        unknown target version are 404 here.
+
+        ``reason`` uses a fixed precedence: an instance that is not running
+        reports ``instance_not_running`` even when it also lacks a recorded
+        version or would fail the step checks; a running instance without a
+        recorded version reports ``missing_recorded_version`` (its
+        currentSteps are null); otherwise the first failed step rule wins —
+        ``step_count_changed``, then ``step_name_changed``, then
+        ``entered_step_changed``. The response carries the instance's current
+        revision so the HTTP layer can emit the same ETag as GET instance.
+        """
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise InvalidRequest("version must be a positive integer")
+        with self._lock:
+            row = self._db.execute(
+                "SELECT workflow, state, version, instance_version FROM instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
+            if row is None:
+                raise InstanceNotFound(f"no instance {instance_id}")
+            name, raw_state, current_version, raw_revision = row
+            target = self.workflow(name, version)  # unknown version -> NotFound
+            state = _read_state(raw_state)
+            current_steps: list[dict[str, Any]] | None = None
+            if current_version is not None:
+                current_steps = self.workflow(name, current_version)["steps"]
+            target_steps = target["steps"]
+            index = int(state["index"])
+            if state["status"] != "running":
+                compatible, reason = False, "instance_not_running"
+            elif current_version is None:
+                compatible, reason = False, "missing_recorded_version"
+            else:
+                reason = self._compatibility_reason(current_steps, target_steps, index)
+                compatible = reason is None
+        revision = raw_revision if raw_revision is not None else 1
+        return _RevisionedResponse(
+            {"id": instance_id, "workflow": name,
+             "currentVersion": current_version, "targetVersion": version,
+             "currentIndex": index, "state": state,
+             "currentSteps": current_steps, "targetSteps": target_steps,
+             "compatible": compatible, "reason": reason},
+            revision,
+        )
+
     def recover(self, instance_id: str, if_match: int | None = None,
                 now_ms: int | None = None) -> dict[str, Any]:
         """Explicitly recover a dead_lettered instance back to running.
@@ -995,21 +1063,48 @@ class Engine:
         )
 
     @staticmethod
+    def _compatibility_reason(current_steps: list[dict[str, Any]],
+                              target_steps: list[dict[str, Any]],
+                              index: int) -> str | None:
+        """Why a migration from *current_steps* to *target_steps* is not possible
+        for an instance at *index*, or None when it is compatible.
+
+        Precedence is fixed: a different step count beats any name difference,
+        which beats a difference in an already-entered step's definition. Steps
+        the instance has not entered (positions after *index*) may differ freely
+        once the count, names and entered-step definitions line up.
+        """
+        if len(current_steps) != len(target_steps):
+            return "step_count_changed"
+        if any(current["name"] != target["name"]
+               for current, target in zip(current_steps, target_steps)):
+            return "step_name_changed"
+        if any(position <= index and current != target
+               for position, (current, target) in enumerate(
+                   zip(current_steps, target_steps))):
+            return "entered_step_changed"
+        return None
+
+    @staticmethod
     def _check_compatible(current_steps: list[dict[str, Any]], target_steps: list[dict[str, Any]],
                           index: int) -> None:
-        if len(current_steps) != len(target_steps):
+        reason = Engine._compatibility_reason(current_steps, target_steps, index)
+        if reason == "step_count_changed":
             raise InvalidTransition("target version has a different number of steps")
-        for position, (current, target) in enumerate(zip(current_steps, target_steps)):
-            if current["name"] != target["name"]:
-                raise InvalidTransition(
-                    f"step {position} is {current['name']!r} in the current version "
-                    f"but {target['name']!r} in the target version"
-                )
-            if position <= index and current != target:
-                raise InvalidTransition(
-                    f"step {position} ({current['name']!r}) was already entered and its "
-                    "definition differs in the target version"
-                )
+        if reason == "step_name_changed":
+            for position, (current, target) in enumerate(zip(current_steps, target_steps)):
+                if current["name"] != target["name"]:
+                    raise InvalidTransition(
+                        f"step {position} is {current['name']!r} in the current version "
+                        f"but {target['name']!r} in the target version"
+                    )
+        if reason == "entered_step_changed":
+            for position, (current, target) in enumerate(zip(current_steps, target_steps)):
+                if position <= index and current != target:
+                    raise InvalidTransition(
+                        f"step {position} ({current['name']!r}) was already entered and its "
+                        "definition differs in the target version"
+                    )
 
     def audit(self, instance_id: str, limit: Any = None, after_seq: Any = None,
               kind: Any = None) -> dict[str, Any]:
@@ -1168,6 +1263,26 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                 "kind": params.get("kind"),
             }
 
+        def _migration_plan_query_args(self) -> dict[str, Any]:
+            """Query arguments for GET /v1/instances/{id}/migration-plan.
+
+            targetVersion is the only known parameter and it is required: a
+            missing, blank, repeated or unknown parameter is 400. The value is
+            handed to the engine as a raw (percent-decoded) string; its shape
+            (a positive no-leading-zero decimal integer) is validated there,
+            before the instance is looked up.
+            """
+            query = self.path.partition("?")[2]
+            pairs = parse_qsl(query, keep_blank_values=True)
+            names = [name for name, _ in pairs]
+            if len(set(names)) != len(names):
+                raise InvalidRequest("query parameters must not be repeated")
+            unknown = sorted(set(names) - {"targetVersion"})
+            if unknown:
+                raise InvalidRequest(f"unknown query parameters: {unknown}")
+            params = dict(pairs)
+            return {"version": _parse_migration_target(params.get("targetVersion"))}
+
         def do_GET(self) -> None:  # noqa: N802
             try:
                 parts = self._parts()
@@ -1183,6 +1298,8 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, engine.get(parts[2]))
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "audit":
                     return self._send(200, engine.audit(parts[2], **self._audit_query_args()))
+                if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "migration-plan":
+                    return self._send(200, engine.migration_plan(parts[2], **self._migration_plan_query_args()))
                 return self._send(404, {"error": {"code": "not_found"}})
             except SagaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
