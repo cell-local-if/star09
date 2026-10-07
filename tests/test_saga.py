@@ -1345,6 +1345,214 @@ class AuditHttpTests(unittest.TestCase):
         self.assertEqual(body["error"]["code"], "not_found")
 
 
+class AuditPagingEngineTests(unittest.TestCase):
+    """Engine-level coverage of the paged/filterable audit query."""
+
+    def setUp(self) -> None:
+        self.engine = Engine()
+        self.engine.define("approval", _await_workflow())
+
+    def tearDown(self) -> None:
+        self.engine.close()
+
+    def _mixed_history(self) -> str:
+        """Six accepted calls alternating kinds: seq 1,3,5 signals, 2,4,6 events."""
+        iid = self.engine.start("approval", {})["id"]
+        self.engine.signal(iid, "approved", event_id="s-1")          # seq 1 signal
+        self.engine.advance(iid, "succeeded", event_id="e-2")        # seq 2 event
+        self.engine.signal(iid, "shipped", event_id="s-3")           # seq 3 signal
+        return iid
+
+    def test_no_params_keeps_baseline_shape_without_next_seq(self) -> None:
+        iid = self._mixed_history()
+        audit = self.engine.audit(iid)
+        self.assertEqual([h["seq"] for h in audit["history"]], [1, 2, 3])
+        self.assertNotIn("nextSeq", audit)
+
+    def test_limit_pages_with_next_seq_cursor(self) -> None:
+        iid = self._mixed_history()
+        page1 = self.engine.audit(iid, limit="2")
+        self.assertEqual([h["seq"] for h in page1["history"]], [1, 2])
+        self.assertEqual(page1["nextSeq"], 2)
+        page2 = self.engine.audit(iid, limit="2", after_seq=str(page1["nextSeq"]))
+        self.assertEqual([h["seq"] for h in page2["history"]], [3])
+        self.assertIsNone(page2["nextSeq"])
+
+    def test_limit_defaults_to_50_when_other_params_given(self) -> None:
+        iid = self._mixed_history()
+        audit = self.engine.audit(iid, after_seq="0")
+        self.assertEqual([h["seq"] for h in audit["history"]], [1, 2, 3])
+        self.assertIsNone(audit["nextSeq"])
+
+    def test_kind_filter_selects_records_without_changing_them(self) -> None:
+        iid = self._mixed_history()
+        signals = self.engine.audit(iid, kind="signal")
+        self.assertEqual([h["seq"] for h in signals["history"]], [1, 3])
+        self.assertEqual([h["kind"] for h in signals["history"]], ["signal", "signal"])
+        self.assertIsNone(signals["nextSeq"])
+        full = self.engine.audit(iid)
+        # Records are identical to the unpaged ones, only the set is filtered.
+        self.assertEqual(signals["history"], [h for h in full["history"] if h["kind"] == "signal"])
+        events = self.engine.audit(iid, kind="event")
+        self.assertEqual([h["seq"] for h in events["history"]], [2])
+
+    def test_after_seq_cursor_applies_before_kind_filter(self) -> None:
+        iid = self._mixed_history()
+        # afterSeq=1 skips seq 1 (a signal); the next signal is seq 3.
+        page = self.engine.audit(iid, kind="signal", after_seq="1")
+        self.assertEqual([h["seq"] for h in page["history"]], [3])
+        self.assertIsNone(page["nextSeq"])
+
+    def test_kind_filter_paginates_over_filtered_matches_only(self) -> None:
+        iid = self._mixed_history()
+        page1 = self.engine.audit(iid, kind="signal", limit="1")
+        self.assertEqual([h["seq"] for h in page1["history"]], [1])
+        self.assertEqual(page1["nextSeq"], 1)
+        page2 = self.engine.audit(iid, kind="signal", limit="1", after_seq="1")
+        self.assertEqual([h["seq"] for h in page2["history"]], [3])
+        self.assertIsNone(page2["nextSeq"])
+
+    def test_empty_page_returns_empty_history_and_null_next_seq(self) -> None:
+        iid = self._mixed_history()
+        page = self.engine.audit(iid, after_seq="99")
+        self.assertEqual(page["history"], [])
+        self.assertIsNone(page["nextSeq"])
+        fresh = self.engine.start("order", {})["id"]
+        page = self.engine.audit(fresh, limit="10")
+        self.assertEqual(page["history"], [])
+        self.assertIsNone(page["nextSeq"])
+
+    def test_paged_response_carries_instance_fields_and_revision(self) -> None:
+        iid = self._mixed_history()
+        page = self.engine.audit(iid, limit="1")
+        self.assertEqual(page["id"], iid)
+        self.assertEqual(page["workflow"], "approval")
+        self.assertEqual(page["workflowVersion"], 1)
+        self.assertEqual(page["state"]["status"], "completed")
+        self.assertEqual(page.revision, 4)  # start + 3 accepted calls
+
+    def test_invalid_params_raise_before_instance_lookup(self) -> None:
+        bad_calls = [
+            {"limit": "0"}, {"limit": "101"}, {"limit": "01"}, {"limit": ""},
+            {"limit": "1.5"}, {"limit": "true"}, {"limit": "abc"},
+            {"after_seq": "-1"}, {"after_seq": "00"}, {"after_seq": "1.0"},
+            {"after_seq": ""}, {"after_seq": "x"},
+            {"kind": "events"}, {"kind": ""}, {"kind": "EVENT"},
+        ]
+        for params in bad_calls:
+            with self.subTest(params=params):
+                with self.assertRaises(InvalidRequest):
+                    self.engine.audit("no-such-instance", **params)
+
+    def test_valid_params_on_missing_instance_raise_not_found(self) -> None:
+        with self.assertRaises(InstanceNotFound):
+            self.engine.audit("no-such-instance", limit="10", after_seq="0", kind="event")
+
+    def test_paged_query_is_read_only(self) -> None:
+        iid = self._mixed_history()
+        before = self.engine.audit(iid)
+        self.engine.audit(iid, limit="1", kind="event", after_seq="0")
+        after = self.engine.audit(iid)
+        self.assertEqual(before, after)
+        self.assertEqual(before.revision, after.revision)
+
+
+class AuditPagingHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from saga import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def call(self, method: str, path: str, body: dict | None = None):
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def get_headers(self, path: str):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", method="GET")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, dict(response.headers), json.loads(response.read() or b"{}")
+
+    def _instance_with_history(self) -> str:
+        self.call("PUT", "/v1/workflows/paged", {"steps": [
+            {"name": "s1", "compensation": "c1", "await": {"event": "go"}},
+            {"name": "s2", "compensation": "c2"},
+        ]})
+        status, body = self.call("POST", "/v1/workflows/paged/instances", {})
+        iid = body["id"]
+        self.call("POST", f"/v1/instances/{iid}/signals", {"event": "go", "eventId": "sig-1"})
+        self.call("POST", f"/v1/instances/{iid}/events", {"outcome": "succeeded", "eventId": "evt-2"})
+        return iid
+
+    def test_paged_audit_end_to_end_with_etag(self) -> None:
+        iid = self._instance_with_history()
+        status, headers, page = self.get_headers(f"/v1/instances/{iid}/audit?limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("ETag"), '"3"')
+        self.assertEqual([h["seq"] for h in page["history"]], [1])
+        self.assertEqual(page["nextSeq"], 1)
+        status, page2 = self.call("GET", f"/v1/instances/{iid}/audit?limit=1&afterSeq=1&kind=event")
+        self.assertEqual(status, 200)
+        self.assertEqual([h["seq"] for h in page2["history"]], [2])
+        self.assertEqual(page2["history"][0]["kind"], "event")
+        self.assertIsNone(page2["nextSeq"])
+
+    def test_unpaged_audit_has_no_pagination_fields(self) -> None:
+        iid = self._instance_with_history()
+        status, audit = self.call("GET", f"/v1/instances/{iid}/audit")
+        self.assertEqual(status, 200)
+        self.assertEqual([h["seq"] for h in audit["history"]], [1, 2])
+        self.assertNotIn("nextSeq", audit)
+
+    def test_invalid_query_params_are_400(self) -> None:
+        iid = self._instance_with_history()
+        bad_paths = [
+            f"/v1/instances/{iid}/audit?limit=0",
+            f"/v1/instances/{iid}/audit?limit=101",
+            f"/v1/instances/{iid}/audit?limit=01",
+            f"/v1/instances/{iid}/audit?limit=",
+            f"/v1/instances/{iid}/audit?limit=1.5",
+            f"/v1/instances/{iid}/audit?limit=true",
+            f"/v1/instances/{iid}/audit?afterSeq=-1",
+            f"/v1/instances/{iid}/audit?afterSeq=00",
+            f"/v1/instances/{iid}/audit?kind=events",
+            f"/v1/instances/{iid}/audit?kind=",
+            f"/v1/instances/{iid}/audit?limit=1&limit=2",
+            f"/v1/instances/{iid}/audit?bogus=1",
+            f"/v1/instances/{iid}/audit?limit=2&bogus=1",
+        ]
+        for path in bad_paths:
+            with self.subTest(path=path):
+                status, body = self.call("GET", path)
+                self.assertEqual(status, 400)
+                self.assertEqual(body["error"]["code"], "invalid_request")
+        # The rejected queries changed nothing.
+        status, audit = self.call("GET", f"/v1/instances/{iid}/audit")
+        self.assertEqual([h["seq"] for h in audit["history"]], [1, 2])
+
+    def test_invalid_params_on_missing_instance_are_400_not_404(self) -> None:
+        status, body = self.call("GET", "/v1/instances/missing/audit?limit=0")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "invalid_request")
+
+    def test_valid_params_on_missing_instance_are_404(self) -> None:
+        status, body = self.call("GET", "/v1/instances/missing/audit?limit=10&kind=event&afterSeq=0")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "not_found")
+
+
 class AwaitTimeoutDefinitionTests(unittest.TestCase):
     """Validation of the optional timeoutMs field on a step's await object."""
 

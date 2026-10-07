@@ -99,6 +99,37 @@ def parse_if_match(raw: str | None) -> int | None:
     return int(digits)
 
 
+def _parse_audit_limit(raw: Any) -> int:
+    """Page size for a paged audit query: a decimal integer in 1..100 carried as a
+    raw query string, defaulting to 50 when the parameter is absent. Leading zeros,
+    empty values, booleans and decimal-point forms are all 400."""
+    if raw is None:
+        return 50
+    if (not isinstance(raw, str) or not raw or not raw.isascii()
+            or not raw.isdigit() or (len(raw) > 1 and raw[0] == "0")):
+        raise InvalidRequest(
+            "limit must be a decimal integer between 1 and 100 without leading zeros"
+        )
+    size = int(raw)
+    if not 1 <= size <= 100:
+        raise InvalidRequest("limit must be between 1 and 100")
+    return size
+
+
+def _parse_audit_after_seq(raw: Any) -> int:
+    """Audit cursor for a paged query: a non-negative decimal integer carried as a
+    raw query string, defaulting to 0 (start from the first record) when absent.
+    Leading zeros, empty values, signs and decimal-point forms are all 400."""
+    if raw is None:
+        return 0
+    if (not isinstance(raw, str) or not raw or not raw.isascii()
+            or not raw.isdigit() or (len(raw) > 1 and raw[0] == "0")):
+        raise InvalidRequest(
+            "afterSeq must be a non-negative decimal integer without leading zeros"
+        )
+    return int(raw)
+
+
 def _validate_ordering(partition_key: Any, sequence: Any, has_event_id: bool) -> tuple[str | None, int | None]:
     """Validate the optional ``(partitionKey, sequence)`` ordering pair.
 
@@ -980,13 +1011,32 @@ class Engine:
                     "definition differs in the target version"
                 )
 
-    def audit(self, instance_id: str) -> dict[str, Any]:
+    def audit(self, instance_id: str, limit: Any = None, after_seq: Any = None,
+              kind: Any = None) -> dict[str, Any]:
         """Read-only audit view: current state plus the accepted calls in commit order.
 
         History rows come back as ``{"seq", "kind", "eventId", "request", "response"}``
         with seq strictly increasing from 1; instances that predate the audit table
         simply have an empty (or short) history — nothing is fabricated.
+
+        Without any of ``limit``/``after_seq``/``kind`` the response is exactly the
+        baseline shape (full history, no pagination fields). As soon as one of them
+        is carried the call switches to paged mode: the parameters are validated
+        *before* the instance is looked up (an invalid query is 400 even for a
+        missing instance; a valid query on a missing instance is 404), and the
+        response adds ``nextSeq`` — the seq of the page's last record when further
+        matching records exist beyond it, else None. ``after_seq`` is a cursor on
+        the unfiltered audit sequence: records are selected by ``seq > after_seq``
+        first and only then filtered by ``kind``, so skipped kinds never disturb
+        the seq ordering. The query is read-only: nothing is written to state,
+        ledgers, audit or partition cursors either way.
         """
+        paged = limit is not None or after_seq is not None or kind is not None
+        if paged:
+            size = _parse_audit_limit(limit)
+            cursor = _parse_audit_after_seq(after_seq)
+            if kind is not None and kind not in ("event", "signal"):
+                raise InvalidRequest("kind must be 'event' or 'signal'")
         with self._lock:
             row = self._db.execute(
                 "SELECT workflow, state, version, instance_version FROM instances WHERE id = ?",
@@ -994,22 +1044,41 @@ class Engine:
             ).fetchone()
             if row is None:
                 raise InstanceNotFound(f"no instance {instance_id}")
-            rows = self._db.execute(
-                "SELECT seq, kind, event_id, request, response FROM instance_audit "
-                "WHERE instance_id = ? ORDER BY seq",
-                (instance_id,),
-            ).fetchall()
+            if paged:
+                clauses = ["instance_id = ?", "seq > ?"]
+                params: list[Any] = [instance_id, cursor]
+                if kind is not None:
+                    clauses.append("kind = ?")
+                    params.append(kind)
+                # One extra row decides whether a next page exists.
+                rows = self._db.execute(
+                    "SELECT seq, kind, event_id, request, response FROM instance_audit "
+                    f"WHERE {' AND '.join(clauses)} ORDER BY seq LIMIT ?",
+                    (*params, size + 1),
+                ).fetchall()
+            else:
+                rows = self._db.execute(
+                    "SELECT seq, kind, event_id, request, response FROM instance_audit "
+                    "WHERE instance_id = ? ORDER BY seq",
+                    (instance_id,),
+                ).fetchall()
+        if paged:
+            page = rows[:size]
+            next_seq: int | None = page[-1][0] if len(rows) > size else None
+        else:
+            page, next_seq = rows, None
         history = [
-            {"seq": seq, "kind": kind, "eventId": event_id,
+            {"seq": seq, "kind": record_kind, "eventId": event_id,
              "request": json.loads(request), "response": json.loads(response)}
-            for seq, kind, event_id, request, response in rows
+            for seq, record_kind, event_id, request, response in page
         ]
         revision = row[3] if row[3] is not None else 1
-        return _RevisionedResponse(
-            {"id": instance_id, "workflow": row[0], "workflowVersion": row[2],
-             "state": _read_state(row[1]), "history": history},
-            revision,
-        )
+        body: dict[str, Any] = {"id": instance_id, "workflow": row[0],
+                                "workflowVersion": row[2],
+                                "state": _read_state(row[1]), "history": history}
+        if paged:
+            body["nextSeq"] = next_seq
+        return _RevisionedResponse(body, revision)
 
 
 def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
@@ -1076,6 +1145,29 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                 "limit": params.get("limit"),
             }
 
+        def _audit_query_args(self) -> dict[str, Any]:
+            """Query arguments for GET /v1/instances/{id}/audit.
+
+            Only limit/afterSeq/kind are known; a repeated or unknown parameter
+            is 400. Values are handed to the engine as raw (percent-decoded)
+            strings; shape validation happens there, before the instance lookup.
+            No query string at all means the baseline unpaged response.
+            """
+            query = self.path.partition("?")[2]
+            pairs = parse_qsl(query, keep_blank_values=True)
+            names = [name for name, _ in pairs]
+            if len(set(names)) != len(names):
+                raise InvalidRequest("query parameters must not be repeated")
+            unknown = sorted(set(names) - {"limit", "afterSeq", "kind"})
+            if unknown:
+                raise InvalidRequest(f"unknown query parameters: {unknown}")
+            params = dict(pairs)
+            return {
+                "limit": params.get("limit"),
+                "after_seq": params.get("afterSeq"),
+                "kind": params.get("kind"),
+            }
+
         def do_GET(self) -> None:  # noqa: N802
             try:
                 parts = self._parts()
@@ -1090,7 +1182,7 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                 if len(parts) == 3 and parts[:2] == ["v1", "instances"]:
                     return self._send(200, engine.get(parts[2]))
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "audit":
-                    return self._send(200, engine.audit(parts[2]))
+                    return self._send(200, engine.audit(parts[2], **self._audit_query_args()))
                 return self._send(404, {"error": {"code": "not_found"}})
             except SagaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
