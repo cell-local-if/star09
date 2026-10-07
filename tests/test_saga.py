@@ -3863,5 +3863,229 @@ class RecoverHttpTests(unittest.TestCase):
         self.assertEqual(body["state"]["status"], "running")
 
 
+class ListInstancesEngineTests(unittest.TestCase):
+    """Engine-level coverage of the read-only instance listing."""
+
+    def setUp(self) -> None:
+        self.engine = Engine()
+
+    def tearDown(self) -> None:
+        self.engine.close()
+
+    def _start(self, workflow: str = "order") -> str:
+        return self.engine.start(workflow, {})["id"]
+
+    def test_empty_store_returns_empty_page_and_null_cursor(self) -> None:
+        self.assertEqual(self.engine.list_instances(),
+                         {"instances": [], "nextCursor": None})
+
+    def test_instances_sorted_by_id_with_stable_pagination(self) -> None:
+        ids = sorted(self._start() for _ in range(5))
+        first = self.engine.list_instances(limit="2")
+        self.assertEqual([i["id"] for i in first["instances"]], ids[:2])
+        self.assertEqual(first["nextCursor"], ids[1])
+        second = self.engine.list_instances(after_id=first["nextCursor"], limit="2")
+        self.assertEqual([i["id"] for i in second["instances"]], ids[2:4])
+        self.assertEqual(second["nextCursor"], ids[3])
+        third = self.engine.list_instances(after_id=second["nextCursor"], limit="2")
+        self.assertEqual([i["id"] for i in third["instances"]], ids[4:])
+        self.assertIsNone(third["nextCursor"])
+
+    def test_page_ending_exactly_at_the_last_match_has_null_cursor(self) -> None:
+        ids = sorted(self._start() for _ in range(4))
+        page = self.engine.list_instances(limit="4")
+        self.assertEqual([i["id"] for i in page["instances"]], ids)
+        self.assertIsNone(page["nextCursor"])
+        second = self.engine.list_instances(after_id=ids[1], limit="2")
+        self.assertEqual([i["id"] for i in second["instances"]], ids[2:])
+        self.assertIsNone(second["nextCursor"])
+
+    def test_default_limit_is_50(self) -> None:
+        ids = sorted(self._start() for _ in range(3))
+        page = self.engine.list_instances()
+        self.assertEqual([i["id"] for i in page["instances"]], ids)
+        self.assertIsNone(page["nextCursor"])
+
+    def test_filters_by_workflow_and_status(self) -> None:
+        self.engine.define("mini", {"steps": [{"name": "a", "compensation": "undo-a"}]})
+        running = self._start("order")
+        completed = self._start("mini")
+        self.engine.advance(completed, "succeeded")
+        compensated = self._start("order")
+        self.engine.advance(compensated, "failed")
+
+        page = self.engine.list_instances(workflow="order")
+        self.assertEqual([i["id"] for i in page["instances"]], sorted([running, compensated]))
+        page = self.engine.list_instances(status="completed")
+        self.assertEqual([i["id"] for i in page["instances"]], [completed])
+        page = self.engine.list_instances(workflow="order", status="compensated")
+        self.assertEqual([i["id"] for i in page["instances"]], [compensated])
+        page = self.engine.list_instances(workflow="order", status="dead_lettered")
+        self.assertEqual(page, {"instances": [], "nextCursor": None})
+
+        # Item shape: exactly the four public fields, state as GET /v1/instances/{id}.
+        item = self.engine.list_instances(workflow="mini")["instances"][0]
+        self.assertEqual(set(item), {"id", "workflow", "workflowVersion", "state"})
+        self.assertEqual(item["workflow"], "mini")
+        self.assertEqual(item["workflowVersion"], 1)
+        self.assertEqual(item["state"], self.engine.get(completed)["state"])
+
+    def test_after_id_is_a_pure_ordering_boundary(self) -> None:
+        ids = sorted(self._start() for _ in range(3))
+        page = self.engine.list_instances(after_id=ids[0])
+        self.assertEqual([i["id"] for i in page["instances"]], ids[1:])
+        # Boundaries that name no instance still split the byte ordering:
+        # "-" sorts before every hex digit, "~" after every uuid character.
+        page = self.engine.list_instances(after_id="-")
+        self.assertEqual([i["id"] for i in page["instances"]], ids)
+        page = self.engine.list_instances(after_id="~")
+        self.assertEqual(page, {"instances": [], "nextCursor": None})
+
+    def test_invalid_query_shapes_are_400(self) -> None:
+        self._start()
+        bad_calls = [
+            {"workflow": ""}, {"workflow": "x" * 101},
+            {"status": ""}, {"status": "Running"}, {"status": "dead"}, {"status": "done"},
+            {"after_id": ""}, {"after_id": "x" * 201},
+            {"limit": ""}, {"limit": "0"}, {"limit": "01"}, {"limit": "007"},
+            {"limit": "1.5"}, {"limit": "abc"}, {"limit": "-1"}, {"limit": "+1"},
+            {"limit": " 1"}, {"limit": "1 "}, {"limit": "101"}, {"limit": "100000"},
+        ]
+        for kwargs in bad_calls:
+            with self.assertRaises(InvalidRequest, msg=repr(kwargs)):
+                self.engine.list_instances(**kwargs)
+        # Boundary values are accepted.
+        self.engine.list_instances(workflow="x" * 100, after_id="x" * 200, limit="1")
+        self.engine.list_instances(limit="100")
+
+    def test_legacy_instance_lists_with_null_version_and_backfilled_state(self) -> None:
+        fd, path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        try:
+            legacy = sqlite3.connect(path)
+            legacy.execute(
+                "CREATE TABLE instances (id TEXT PRIMARY KEY, workflow TEXT NOT NULL, state TEXT NOT NULL)"
+            )
+            state = initial_state(WORKFLOWS["order"], {})
+            del state["waitingFor"]
+            del state["deadlineAt"]
+            legacy.execute("INSERT INTO instances VALUES (?, ?, ?)",
+                           ("legacy-id", "order", json.dumps(state)))
+            legacy.commit()
+            legacy.close()
+
+            engine = Engine(path)
+            try:
+                page = engine.list_instances()
+                self.assertIsNone(page["nextCursor"])
+                item = page["instances"][0]
+                self.assertEqual(item["id"], "legacy-id")
+                self.assertIsNone(item["workflowVersion"])
+                self.assertIsNone(item["state"]["waitingFor"])
+                self.assertIsNone(item["state"]["deadlineAt"])
+            finally:
+                engine.close()
+        finally:
+            os.unlink(path)
+
+
+class ListInstancesHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from saga import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def call(self, method: str, path: str, body: dict | None = None):
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def test_list_filters_and_paginates_end_to_end(self) -> None:
+        self.call("PUT", "/v1/workflows/lw", {"steps": [
+            {"name": "a", "compensation": "undo-a"},
+            {"name": "b", "compensation": "undo-b"},
+        ]})
+        created = [self.call("POST", "/v1/workflows/lw/instances", {})[1]["id"] for _ in range(3)]
+        ids = sorted(created)
+        # One instance compensated, the rest still running.
+        self.call("POST", f"/v1/instances/{ids[0]}/events", {"outcome": "failed"})
+
+        status, body = self.call("GET", "/v1/instances?workflow=lw")
+        self.assertEqual(status, 200)
+        self.assertEqual([i["id"] for i in body["instances"]], ids)
+        self.assertIsNone(body["nextCursor"])
+        item = body["instances"][0]
+        self.assertEqual(set(item), {"id", "workflow", "workflowVersion", "state"})
+        self.assertEqual(item["workflowVersion"], 1)
+        self.assertEqual(item["state"]["status"], "compensated")
+
+        status, page1 = self.call("GET", "/v1/instances?workflow=lw&limit=2")
+        self.assertEqual(status, 200)
+        self.assertEqual([i["id"] for i in page1["instances"]], ids[:2])
+        self.assertEqual(page1["nextCursor"], ids[1])
+        status, page2 = self.call(
+            "GET", f"/v1/instances?workflow=lw&limit=2&afterId={page1['nextCursor']}")
+        self.assertEqual([i["id"] for i in page2["instances"]], ids[2:])
+        self.assertIsNone(page2["nextCursor"])
+
+        status, body = self.call("GET", "/v1/instances?workflow=lw&status=running")
+        self.assertEqual([i["id"] for i in body["instances"]], ids[1:])
+        status, body = self.call("GET", "/v1/instances?workflow=lw&status=compensated")
+        self.assertEqual([i["id"] for i in body["instances"]], ids[:1])
+        status, body = self.call("GET", "/v1/instances?workflow=lw&status=dead_lettered")
+        self.assertEqual((body["instances"], body["nextCursor"]), ([], None))
+        # afterId is a boundary, not a lookup: an unknown id value is fine.
+        status, body = self.call("GET", "/v1/instances?workflow=lw&afterId=~")
+        self.assertEqual((status, body["instances"], body["nextCursor"]), (200, [], None))
+
+    def test_list_query_validation_errors_are_400(self) -> None:
+        bad_paths = [
+            "/v1/instances?workflow=",
+            "/v1/instances?workflow=" + "x" * 101,
+            "/v1/instances?status=",
+            "/v1/instances?status=Running",
+            "/v1/instances?status=dead",
+            "/v1/instances?afterId=",
+            "/v1/instances?afterId=" + "x" * 201,
+            "/v1/instances?limit=",
+            "/v1/instances?limit=0",
+            "/v1/instances?limit=01",
+            "/v1/instances?limit=1.5",
+            "/v1/instances?limit=abc",
+            "/v1/instances?limit=-1",
+            "/v1/instances?limit=101",
+            "/v1/instances?limit=1&limit=2",
+            "/v1/instances?workflow=a&workflow=a",
+            "/v1/instances?status=running&status=running",
+            "/v1/instances?bogus=1",
+            "/v1/instances?limit=50&bogus=1",
+        ]
+        for path in bad_paths:
+            status, body = self.call("GET", path)
+            self.assertEqual(status, 400, path)
+            self.assertEqual(body["error"]["code"], "invalid_request", path)
+
+    def test_list_accepts_boundary_values_and_ignores_nothing_existing(self) -> None:
+        status, body = self.call("GET", "/v1/instances?limit=1")
+        self.assertEqual(status, 200)
+        self.assertLessEqual(len(body["instances"]), 1)
+        status, body = self.call("GET", "/v1/instances?limit=100&workflow=no-such-workflow")
+        self.assertEqual((status, body), (200, {"instances": [], "nextCursor": None}))
+        # Unknown deeper paths are still 404.
+        self.assertEqual(self.call("GET", "/v1/instances/x/y/z")[0], 404)
+
+
 if __name__ == "__main__":
     unittest.main()

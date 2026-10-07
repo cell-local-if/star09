@@ -13,6 +13,7 @@ import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import parse_qsl
 
 
 class SagaError(Exception):
@@ -50,6 +51,9 @@ WORKFLOWS: dict[str, dict[str, Any]] = {
 
 # Sentinel: distinguishes "eventId not carried" (baseline behavior) from an explicit null.
 _UNSET = object()
+
+# The only values the instance-listing status filter accepts.
+LIST_STATUSES = ("running", "completed", "compensated", "dead_lettered")
 
 
 class _RevisionedResponse(dict):
@@ -790,6 +794,77 @@ class Engine:
             revision,
         )
 
+    def list_instances(self, workflow: Any = None, status: Any = None,
+                       after_id: Any = None, limit: Any = None) -> dict[str, Any]:
+        """Read-only page of instances ordered by id ascending (byte order).
+
+        ``workflow`` filters by exact workflow name, ``status`` by the state's
+        status field (one of :data:`LIST_STATUSES`); both are omitted (None)
+        when the caller did not ask for them. ``after_id`` is an exclusive
+        byte-order boundary on the instance id — it is a position in the
+        ordering, not a lookup, so it need not name an existing instance.
+        ``limit`` is the raw query literal: a decimal integer in 1..100 with
+        no leading zeros, defaulting to 50 when omitted. Any invalid shape
+        raises InvalidRequest and nothing is written (the query is read-only).
+
+        The page carries ``limit`` items at most; one extra row is fetched to
+        decide ``nextCursor``, which is the id of the page's last item when
+        further matches exist beyond it and None otherwise. Items expose the
+        same ``id``/``workflow``/``workflowVersion``/``state`` shape as
+        :meth:`get` (``workflowVersion`` is None for pre-versioning instances,
+        and ``state`` goes through the same legacy backfill).
+        """
+        if workflow is not None and (
+            not isinstance(workflow, str) or not workflow or len(workflow) > 100
+        ):
+            raise InvalidRequest("workflow must be a non-empty string of at most 100 characters")
+        if status is not None and status not in LIST_STATUSES:
+            raise InvalidRequest(
+                "status must be one of running, completed, compensated, dead_lettered"
+            )
+        if after_id is not None and (
+            not isinstance(after_id, str) or not after_id or len(after_id) > 200
+        ):
+            raise InvalidRequest("afterId must be a non-empty string of at most 200 characters")
+        if limit is None:
+            size = 50
+        else:
+            if (not isinstance(limit, str) or not limit or not limit.isascii()
+                    or not limit.isdigit() or (len(limit) > 1 and limit[0] == "0")):
+                raise InvalidRequest(
+                    "limit must be a decimal integer between 1 and 100 without leading zeros"
+                )
+            size = int(limit)
+            if not 1 <= size <= 100:
+                raise InvalidRequest("limit must be between 1 and 100")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if workflow is not None:
+            clauses.append("workflow = ?")
+            params.append(workflow)
+        if status is not None:
+            clauses.append("json_extract(state, '$.status') = ?")
+            params.append(status)
+        if after_id is not None:
+            clauses.append("id > ?")
+            params.append(after_id)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT id, workflow, state, version FROM instances{where} "
+                "ORDER BY id LIMIT ?",
+                (*params, size + 1),
+            ).fetchall()
+        page = rows[:size]
+        instances = [
+            {"id": row_id, "workflow": name, "workflowVersion": version,
+             "state": _read_state(raw_state)}
+            for row_id, name, raw_state, version in page
+        ]
+        next_cursor = page[-1][0] if len(rows) > size else None
+        return {"instances": instances, "nextCursor": next_cursor}
+
+
     def migrate(self, instance_id: str, version: Any, if_match: int | None = None) -> dict[str, Any]:
         """Re-pin a running instance to another existing version of the same workflow.
 
@@ -978,6 +1053,29 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
         def _parts(self) -> list[str]:
             return [p for p in self.path.split("?")[0].split("/") if p]
 
+        def _list_query_args(self) -> dict[str, Any]:
+            """Query arguments for GET /v1/instances.
+
+            Only workflow/status/afterId/limit are known; a repeated or
+            unknown parameter is 400. Values are handed to the engine as raw
+            (percent-decoded) strings; shape validation happens there.
+            """
+            query = self.path.partition("?")[2]
+            pairs = parse_qsl(query, keep_blank_values=True)
+            names = [name for name, _ in pairs]
+            if len(set(names)) != len(names):
+                raise InvalidRequest("query parameters must not be repeated")
+            unknown = sorted(set(names) - {"workflow", "status", "afterId", "limit"})
+            if unknown:
+                raise InvalidRequest(f"unknown query parameters: {unknown}")
+            params = dict(pairs)
+            return {
+                "workflow": params.get("workflow"),
+                "status": params.get("status"),
+                "after_id": params.get("afterId"),
+                "limit": params.get("limit"),
+            }
+
         def do_GET(self) -> None:  # noqa: N802
             try:
                 parts = self._parts()
@@ -987,6 +1085,8 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, {"workflows": engine.workflow_names()})
                 if len(parts) == 3 and parts[:2] == ["v1", "workflows"]:
                     return self._send(200, engine.workflow_info(parts[2]))
+                if parts == ["v1", "instances"]:
+                    return self._send(200, engine.list_instances(**self._list_query_args()))
                 if len(parts) == 3 and parts[:2] == ["v1", "instances"]:
                     return self._send(200, engine.get(parts[2]))
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "audit":

@@ -191,6 +191,24 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
   新分区一律从 1 开始；升级前写入的无排序字段账本行，升级后仍按原样回放，不会被误判为载荷冲突。
 - 未知实例的有序调用仍返回 **`404 not_found`**（不创建分区行）；非法推进仍返回 `409 invalid_transition`。
 
+### `GET /v1/instances`
+实例列表只读查询（无请求体，纯读取、不产生任何写入），用于按工作流、状态与稳定分页观察在飞任务、
+补偿结果与死信分布 → `200 {"instances": [...], "nextCursor": <本页最后一项 id 或 null>}`。
+- **查询参数**（全部可选，省略即不过滤或使用默认值；参数不得重复、不得出现未知参数）：
+  - `workflow`：按工作流名**精确**过滤，1–100 字符的非空字符串；
+  - `status`：只允许 `running`、`completed`、`compensated`、`dead_lettered`；
+  - `afterId`：实例 id 的**字节序边界**（1–200 字符的非空字符串），结果从边界之后（不含边界）开始；
+    它只是排序位置，**不要求对应真实实例**；
+  - `limit`：1–100 的**无前导零**十进制整数字符串，默认 `50`。
+- **结果**：实例按 id 升序（字节序）返回，筛选、排序与分页稳定。列表项为
+  `{"id", "workflow", "workflowVersion", "state"}`：`workflowVersion` 对版本化之前持久化的旧实例为
+  `null`；`state` 与 `GET /v1/instances/{id}` 当前公开的结构一致（含旧字段回填规则）。
+- **分页**：还有后续匹配项时 `nextCursor` 取本页最后一项的 id（作为下一页的 `afterId`），否则为
+  `null`；合法但无匹配实例时返回 `200`、空列表与 `null`。
+- **参数非法**：`workflow` 为空或超 100 字符、`status` 不在允许集合、`afterId` 为空或超 200 字符、
+  `limit` 不是无前导零十进制整数或不在 1–100、参数重复或含未知参数
+  ⇒ `400 invalid_request`，且不产生任何写入。
+
 ### `GET /v1/instances/{id}`
 `200 {"id","workflow","workflowVersion","state"}`，并带响应头 **`ETag: "<实例版本>"`**；未知 id ⇒ `404 not_found`。
 `workflowVersion` 为实例固定的定义版本；版本化之前持久化的旧实例（SQLite 中无版本字段）返回
