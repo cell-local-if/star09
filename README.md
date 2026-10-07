@@ -318,6 +318,26 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
   空页返回空 `history` 与 `nextSeq: null`。
 - 两种模式都是只读查询：不写状态、幂等账本、审计表或分区游标。
 
+### `GET /v1/instances/{id}/timeline`
+实例级只读**时间线**查询（无请求体）：把审计记录逐条投影为当时的状态快照，便于逐步查看状态变化 →
+`200 {"id","workflow","workflowVersion","state","timeline":[...],"nextSeq": <int|null>}`，
+并带响应头 **`ETag: "<当前实例版本>"`**；未知 id ⇒ `404 not_found`。
+- **查询参数**（全部可选）：`limit` 为 1–200 的**无前导零**十进制整数字符串，默认 `50`；
+  `afterSeq` 为**非负**无前导零十进制整数字符串，默认 `0`，表示从 `seq` 大于该值的记录开始。
+  参数重复、未知参数、空值、前导零、布尔或小数写法、负数、`limit` 越界
+  ⇒ `400 invalid_request`，且不产生任何写入；**参数校验先于实例查找**，
+  合法查询访问未知实例 ⇒ `404 not_found`。
+- **记录集合与排序**：取 `seq > afterSeq` 的审计记录按 `seq` 升序分页，与
+  `GET /v1/instances/{id}/audit` 的 seq 集合、排序与游标完全一致（无 `kind` 过滤）。
+- **每项内容**：固定包含 `seq`、`kind`、`eventId`、`request`，以及该条记录
+  `response.state` 投影出的 `status`、`step`、`index`、`attempt`、`completed`、`compensated`、
+  `waitingFor`、`deadlineAt`、`failure`；`state` 的其余字段（除 `context` 外）同样投影。
+  **不返回 `context`，也不返回完整 `response`**。旧记录缺少 `attempt`/`waitingFor`/`deadlineAt`
+  时在投影中分别显示 `1`/`null`/`null`——仅读取时回填，不改写已存历史。
+- **分页**：`nextSeq` 只在本页之后还有记录时取本页末项的 `seq`，否则为 `null`；
+  空页返回空 `timeline` 与 `nextSeq: null`。
+- **只读**：不写状态、实例版本、幂等账本、审计表或分区游标；重开同一 SQLite 文件后结果一致。
+
 ## 实例版本与 If-Match（显式并发控制）
 
 实例版本用于乐观并发抢占，避免客户端用旧观察结果覆盖已经接受的推进或迁移；它与“定义版本”
@@ -325,7 +345,7 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 
 - **版本起点**：每个实例从版本 **1** 开始。
 - **暴露方式**：`GET /v1/instances/{id}`、`GET /v1/instances/{id}/audit`、
-  `GET /v1/instances/{id}/migration-plan` 与启动成功的 `201`
+  `GET /v1/instances/{id}/timeline`、`GET /v1/instances/{id}/migration-plan` 与启动成功的 `201`
   都返回响应头 **`ETag: "<带双引号的十进制版本>"`**，例如 `ETag: "1"`；成功迁移与成功恢复的 `200`
   响应同样返回反映新实例版本的 `ETag`。
 - **前置条件**：`POST /v1/instances/{id}/events`、`/signals`、`/migrate`、`/recover` 接受可选请求头

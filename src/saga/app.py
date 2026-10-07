@@ -130,6 +130,23 @@ def _parse_audit_after_seq(raw: Any) -> int:
     return int(raw)
 
 
+def _parse_timeline_limit(raw: Any) -> int:
+    """Page size for a timeline query: a decimal integer in 1..200 carried as a
+    raw query string, defaulting to 50 when the parameter is absent. Leading zeros,
+    empty values, booleans and decimal-point forms are all 400."""
+    if raw is None:
+        return 50
+    if (not isinstance(raw, str) or not raw or not raw.isascii()
+            or not raw.isdigit() or (len(raw) > 1 and raw[0] == "0")):
+        raise InvalidRequest(
+            "limit must be a decimal integer between 1 and 200 without leading zeros"
+        )
+    size = int(raw)
+    if not 1 <= size <= 200:
+        raise InvalidRequest("limit must be between 1 and 200")
+    return size
+
+
 def _validate_ordering(partition_key: Any, sequence: Any, has_event_id: bool) -> tuple[str | None, int | None]:
     """Validate the optional ``(partitionKey, sequence)`` ordering pair.
 
@@ -1158,6 +1175,90 @@ class Engine:
             body["nextSeq"] = next_seq
         return _RevisionedResponse(body, revision)
 
+    def timeline(self, instance_id: str, limit: Any = None, after_seq: Any = None) -> dict[str, Any]:
+        """Read-only timeline view: the audit records projected into per-step states.
+
+        ``limit``/``after_seq`` are the raw query literals: ``limit`` is a
+        decimal integer in 1..200 with no leading zeros (default 50),
+        ``after_seq`` a non-negative decimal integer with no leading zeros
+        (default 0). Both are validated *before* the instance is looked up, so
+        an invalid query is 400 even for a missing instance; a valid query on a
+        missing instance is 404.
+
+        Records are selected by ``seq > after_seq`` on the same audit sequence
+        ``GET /v1/instances/{id}/audit`` exposes and returned ascending, so the
+        seq set, ordering and cursor movement match the audit view exactly.
+        Each item carries the record's ``seq``/``kind``/``eventId``/``request``
+        plus the fields of that record's ``response.state`` — except ``context``
+        and the full ``response``, which are never projected. Records written
+        before ``attempt``/``waitingFor``/``deadlineAt`` existed read back as
+        1/None/None in the projection only; the stored history is not rewritten.
+
+        ``nextSeq`` is the seq of the page's last item when further records
+        exist beyond it, else None; an empty page returns an empty timeline and
+        None. The query is read-only: nothing is written to state, ledgers,
+        audit or partition cursors.
+        """
+        size = _parse_timeline_limit(limit)
+        cursor = _parse_audit_after_seq(after_seq)
+        with self._lock:
+            row = self._db.execute(
+                "SELECT workflow, state, version, instance_version FROM instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
+            if row is None:
+                raise InstanceNotFound(f"no instance {instance_id}")
+            # One extra row decides whether a next page exists.
+            rows = self._db.execute(
+                "SELECT seq, kind, event_id, request, response FROM instance_audit "
+                "WHERE instance_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+                (instance_id, cursor, size + 1),
+            ).fetchall()
+        page = rows[:size]
+        next_seq: int | None = page[-1][0] if len(rows) > size else None
+        timeline = [
+            self._timeline_item(seq, record_kind, event_id, request, response)
+            for seq, record_kind, event_id, request, response in page
+        ]
+        revision = row[3] if row[3] is not None else 1
+        return _RevisionedResponse(
+            {"id": instance_id, "workflow": row[0], "workflowVersion": row[2],
+             "state": _read_state(row[1]), "timeline": timeline, "nextSeq": next_seq},
+            revision,
+        )
+
+    @staticmethod
+    def _timeline_item(seq: int, kind: str, event_id: Any, request: str,
+                       response: str) -> dict[str, Any]:
+        """Project one audit record into a timeline item.
+
+        The fixed fields always present are seq/kind/eventId/request plus the
+        state snapshot carried by the record's response, minus ``context``; any
+        further state fields are projected as stored. Legacy snapshots that
+        predate ``attempt``/``waitingFor``/``deadlineAt`` surface the read-time
+        defaults 1/None/None — the stored record itself is never supplemented.
+        """
+        state = json.loads(response).get("state") or {}
+        item: dict[str, Any] = {
+            "seq": seq,
+            "kind": kind,
+            "eventId": event_id,
+            "request": json.loads(request),
+            "status": state.get("status"),
+            "step": state.get("step"),
+            "index": state.get("index"),
+            "attempt": state.get("attempt", 1),
+            "completed": state.get("completed"),
+            "compensated": state.get("compensated"),
+            "waitingFor": state.get("waitingFor"),
+            "deadlineAt": state.get("deadlineAt"),
+            "failure": state.get("failure"),
+        }
+        for key, value in state.items():
+            if key != "context" and key not in item:
+                item[key] = value
+        return item
+
 
 def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
@@ -1246,6 +1347,28 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                 "kind": params.get("kind"),
             }
 
+        def _timeline_query_args(self) -> dict[str, Any]:
+            """Query arguments for GET /v1/instances/{id}/timeline.
+
+            Only limit/afterSeq are known; a repeated or unknown parameter is
+            400. Values are handed to the engine as raw (percent-decoded)
+            strings; shape validation happens there, before the instance
+            lookup.
+            """
+            query = self.path.partition("?")[2]
+            pairs = parse_qsl(query, keep_blank_values=True)
+            names = [name for name, _ in pairs]
+            if len(set(names)) != len(names):
+                raise InvalidRequest("query parameters must not be repeated")
+            unknown = sorted(set(names) - {"limit", "afterSeq"})
+            if unknown:
+                raise InvalidRequest(f"unknown query parameters: {unknown}")
+            params = dict(pairs)
+            return {
+                "limit": params.get("limit"),
+                "after_seq": params.get("afterSeq"),
+            }
+
         def _migration_plan_query_args(self) -> dict[str, Any]:
             """Query arguments for GET /v1/instances/{id}/migration-plan.
 
@@ -1280,6 +1403,8 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, engine.get(parts[2]))
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "audit":
                     return self._send(200, engine.audit(parts[2], **self._audit_query_args()))
+                if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "timeline":
+                    return self._send(200, engine.timeline(parts[2], **self._timeline_query_args()))
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "migration-plan":
                     return self._send(200, engine.migration_plan(parts[2], **self._migration_plan_query_args()))
                 return self._send(404, {"error": {"code": "not_found"}})
