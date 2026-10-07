@@ -95,6 +95,36 @@ def parse_if_match(raw: str | None) -> int | None:
     return int(digits)
 
 
+def _validate_ordering(partition_key: Any, sequence: Any, has_event_id: bool) -> tuple[str | None, int | None]:
+    """Validate the optional ``(partitionKey, sequence)`` ordering pair.
+
+    Ordering is opt-in and activates only when *both* fields are carried and the
+    call also carries a non-empty eventId. Anything short of that is 400:
+
+    * exactly one of the two fields present, or either present without an
+      eventId — ordering cannot ride on an anonymous call;
+    * partitionKey other than a 1..100-character non-empty string (null,
+      booleans, numbers, arrays, objects, empty or too long);
+    * sequence other than a positive JSON integer (booleans rejected
+      explicitly, as are floats, strings and 0/negative numbers).
+
+    Returns ``(None, None)`` for a baseline (unordered) call.
+    """
+    key_present = partition_key is not _UNSET
+    seq_present = sequence is not _UNSET
+    if not key_present and not seq_present:
+        return None, None
+    if not has_event_id or not key_present or not seq_present:
+        raise InvalidRequest(
+            "partitionKey and sequence must be provided together with a non-empty eventId"
+        )
+    if not isinstance(partition_key, str) or not partition_key or len(partition_key) > 100:
+        raise InvalidRequest("partitionKey must be a non-empty string of at most 100 characters")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+        raise InvalidRequest("sequence must be a positive integer")
+    return partition_key, sequence
+
+
 def validate_workflow(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise InvalidRequest("body must be a JSON object")
@@ -380,6 +410,19 @@ class Engine:
             "request TEXT NOT NULL, response TEXT NOT NULL, "
             "PRIMARY KEY (instance_id, seq))"
         )
+        # Partition ordering cursors: one row per (workflow, partitionKey). The
+        # cursor is the last sequence consumed by an accepted ordered call; the
+        # partition's next call must carry cursor + 1. Events and signals share
+        # the cursor and the partition spans every instance of the workflow.
+        # IF NOT EXISTS keeps files created by older builds readable: the table
+        # is added empty, so a partition's first post-upgrade call starts at 1;
+        # no history is fabricated from pre-upgrade calls.
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS partition_cursors ("
+            "workflow TEXT NOT NULL, partition_key TEXT NOT NULL, "
+            "cursor INTEGER NOT NULL, "
+            "PRIMARY KEY (workflow, partition_key))"
+        )
         self._db.commit()
 
     def close(self) -> None:
@@ -475,7 +518,8 @@ class Engine:
         )
 
     def advance(self, instance_id: str, outcome: Any, detail: Any = None, event_id: Any = _UNSET,
-                if_match: int | None = None) -> dict[str, Any]:
+                if_match: int | None = None, partition_key: Any = _UNSET,
+                sequence: Any = _UNSET) -> dict[str, Any]:
         """Apply one outcome event atomically.
 
         Without event_id the behavior is the baseline: every call re-enters the state
@@ -490,36 +534,49 @@ class Engine:
         revision equals it; a stale observation raises InvalidTransition. The
         idempotency replay is checked first: a repeat of an already-accepted
         eventId returns the first response even when the revision has moved on.
+
+        With a validated ``partition_key``/``sequence`` pair (both present, alongside
+        an eventId) the call is additionally ordered within the instance's workflow:
+        sequence 1 opens the partition and every later accepted ordered call consumes
+        the next integer; gaps, stale numbers and mid-flight reordering are 409 with
+        no state change (see :meth:`_commit`).
         """
         if event_id is _UNSET:
             # Anonymous call: no ledger, but the audit trail still records the
             # normalized input with a null eventId.
             normalized = self._normalize_request(None, {"outcome": outcome, "detail": detail},
-                                                 ("eventId", "outcome", "detail"), anonymous=True)
+                                                 ("eventId", "outcome", "detail"), anonymous=True,
+                                                 partition_key=partition_key, sequence=sequence)
         else:
             normalized = self._normalize_request(event_id, {"outcome": outcome, "detail": detail},
-                                                 ("eventId", "outcome", "detail"))
+                                                 ("eventId", "outcome", "detail"),
+                                                 partition_key=partition_key, sequence=sequence)
         return self._commit(instance_id, "instance_events", "event", normalized,
                             lambda workflow, state: apply_outcome(workflow, state, outcome, detail),
                             if_match)
 
     def signal(self, instance_id: str, event: Any, detail: Any = None, event_id: Any = _UNSET,
-               if_match: int | None = None) -> dict[str, Any]:
+               if_match: int | None = None, partition_key: Any = _UNSET,
+               sequence: Any = _UNSET) -> dict[str, Any]:
         """Deliver an external signal to a waiting instance, with eventId semantics
         identical to :meth:`advance` (instance-scoped, full-response replay).
 
         Rejections (bad request, unknown instance, not waiting / mismatched event)
         write no ledger rows. An optional ``if_match`` revision precondition works
         exactly as on :meth:`advance`, and replay still takes precedence over it.
+        Ordered signals (``partition_key``/``sequence``) share the workflow partition
+        cursor with ordered events; see :meth:`advance` and :meth:`_commit`.
         """
         if not isinstance(event, str) or not event or len(event) > 100:
             raise InvalidRequest("event must be a non-empty string of at most 100 characters")
         if event_id is _UNSET:
             normalized = self._normalize_request(None, {"event": event, "detail": detail},
-                                                 ("eventId", "event", "detail"), anonymous=True)
+                                                 ("eventId", "event", "detail"), anonymous=True,
+                                                 partition_key=partition_key, sequence=sequence)
         else:
             normalized = self._normalize_request(event_id, {"event": event, "detail": detail},
-                                                 ("eventId", "event", "detail"))
+                                                 ("eventId", "event", "detail"),
+                                                 partition_key=partition_key, sequence=sequence)
         return self._commit(instance_id, "instance_signals", "signal", normalized,
                             lambda workflow, state: apply_signal(workflow, state, event, detail),
                             if_match)
@@ -528,16 +585,18 @@ class Engine:
                 transition: Any, if_match: int | None = None) -> dict[str, Any]:
         """Shared idempotent commit for outcome events and signals.
 
-        Lookup, ledger replay, precondition check, state transition, revision
-        bump, ledger insert and audit append happen under one lock and in one
-        transaction; the ledger primary key makes a racing duplicate insert fail
-        even if the lock were ever bypassed. Only a call that actually advances
-        the state machine appends an audit row and increments the revision:
-        replays return before the transition and rejections raise before any
-        write. A replay is resolved *before* the If-Match precondition, so a
-        resubmitted accepted eventId replays verbatim on a stale revision.
+        Lookup, ledger replay, precondition check, sequence check, state
+        transition, revision bump, cursor advance, ledger insert and audit
+        append happen under one lock and in one transaction; the ledger primary
+        key makes a racing duplicate insert fail even if the lock were ever
+        bypassed. Only a call that actually advances the state machine appends
+        an audit row, increments the revision and consumes a partition sequence:
+        replays return before the precondition and sequence checks, and
+        rejections raise before any write. The ordered resolution is
+        eventId replay first, then the If-Match precondition, then the sequence.
         """
         event_id = normalized["eventId"]
+        ordered = normalized.get("partitionKey") is not None
         with self._lock:
             row = self._db.execute(
                 "SELECT workflow, state, version, instance_version FROM instances WHERE id = ?",
@@ -558,16 +617,35 @@ class Engine:
                         raise InvalidTransition(
                             f"{kind_label} {event_id!r} was already submitted for this instance with a different payload"
                         )
-                    # Replay beats the precondition: the first response is handed
-                    # back verbatim on whatever revision the instance is now at.
+                    # Replay beats the precondition and the sequence check: the
+                    # first response is handed back verbatim on whatever revision
+                    # the instance is now at and the cursor is not re-consumed.
                     return _RevisionedResponse(json.loads(stored_response), revision)
             # No ledger replay: an explicit precondition must match the current
-            # revision before the state machine is entered. A rejected
-            # precondition writes nothing (no state, no ledger, no audit).
+            # revision before the sequence gate and the state machine are
+            # entered. A rejected precondition writes nothing (no state, no
+            # ledger, no audit, no cursor).
             if if_match is not None and if_match != revision:
                 raise InvalidTransition(
                     f"instance version is {revision}, not {if_match}"
                 )
+            # Ordered call: the sequence must be exactly one past the partition's
+            # persisted cursor (the first call opens the partition at 1). A gap,
+            # a stale number or a reordered in-flight call is rejected here,
+            # before the state machine runs — rejected ordered calls change no
+            # state, revision, ledger, audit or cursor. Events and signals share
+            # the row for (instance workflow, partitionKey).
+            if ordered:
+                cursor_row = self._db.execute(
+                    "SELECT cursor FROM partition_cursors WHERE workflow = ? AND partition_key = ?",
+                    (row[0], normalized["partitionKey"]),
+                ).fetchone()
+                current_cursor = cursor_row[0] if cursor_row is not None else 0
+                if normalized["sequence"] != current_cursor + 1:
+                    raise InvalidTransition(
+                        f"partition {normalized['partitionKey']!r} expects sequence "
+                        f"{current_cursor + 1}, not {normalized['sequence']}"
+                    )
             # The instance advances against the definition of its pinned version, so a
             # later PUT of the same name never affects in-flight instances. Instances
             # persisted before versioning existed (version NULL) resolve the latest
@@ -581,6 +659,11 @@ class Engine:
             state = _read_state(row[1])
             state = transition(workflow, state)
             response = {"id": instance_id, "workflow": row[0], "workflowVersion": version, "state": state}
+            if ordered:
+                # The accepted ordered call carries its partition coordinates in
+                # the response; replays keep whatever the first response carried.
+                response["ordering"] = {"partitionKey": normalized["partitionKey"],
+                                        "sequence": normalized["sequence"]}
             # The transition was accepted: the instance really changed, so the
             # revision advances by exactly one (a NULL legacy revision becomes 2
             # after its first post-upgrade change, never 1 — it read as 1).
@@ -589,6 +672,16 @@ class Engine:
                 "UPDATE instances SET state = ?, version = ?, instance_version = ? WHERE id = ?",
                 (json.dumps(state), version, next_revision, instance_id),
             )
+            if ordered:
+                # Consume the sequence in the same transaction as the state
+                # machine, ledger and audit updates. INSERT ... ON CONFLICT keeps
+                # the partition on its single monotonically increasing row.
+                self._db.execute(
+                    "INSERT INTO partition_cursors (workflow, partition_key, cursor) "
+                    "VALUES (?, ?, ?) ON CONFLICT(workflow, partition_key) "
+                    "DO UPDATE SET cursor = excluded.cursor",
+                    (row[0], normalized["partitionKey"], normalized["sequence"]),
+                )
             if event_id is not None:
                 self._db.execute(
                     f"INSERT INTO {table} (instance_id, event_id, request, response) VALUES (?, ?, ?, ?)",
@@ -609,25 +702,44 @@ class Engine:
 
     @staticmethod
     def _normalize_request(event_id: Any, payload: dict[str, Any], key_order: tuple[str, ...],
-                           anonymous: bool = False) -> dict[str, Any]:
-        """Validate eventId and produce the canonical request used for replay comparison
-        and for the audit trail.
+                           anonymous: bool = False, partition_key: Any = _UNSET,
+                           sequence: Any = _UNSET) -> dict[str, Any]:
+        """Validate eventId/ordering and produce the canonical request used for
+        replay comparison and for the audit trail.
 
         A missing detail and an explicit null detail are the same value, so the
         normalized form always carries ``"detail": null`` unless a detail was given.
-        With ``anonymous=True`` the call carried no eventId at all: validation is
-        skipped and the normalized form records ``"eventId": null``.
+        With ``anonymous=True`` the call carried no eventId at all: eventId
+        validation is skipped and the normalized form records ``"eventId": null``;
+        ordering fields are meaningless on such a call and are rejected.
+
+        Partition ordering activates only when *both* ``partition_key`` and
+        ``sequence`` are carried alongside a real eventId: a lone field, a bad
+        partitionKey (anything but a 1..100-char string) or a bad sequence
+        (anything but a positive integer, booleans included) is 400. Ordered
+        normalized requests append ``"partitionKey"`` and ``"sequence"`` last;
+        unordered ones omit the keys entirely, keeping the baseline JSON form so
+        pre-upgrade ledger rows and audit records still compare exactly.
         """
         if anonymous:
             event_id = None
         elif not isinstance(event_id, str) or not event_id or len(event_id) > 100:
             raise InvalidRequest("eventId must be a non-empty string of at most 100 characters")
+        partition_key, sequence = _validate_ordering(partition_key, sequence, event_id is not None)
         normalized: dict[str, Any] = {"eventId": event_id}
         for key in key_order:
             if key == "eventId":
                 continue
             value = payload.get(key)
             normalized[key] = value if value is not None else None
+        # Ordering keys are appended only for ordered calls. An unordered
+        # normalized request stays byte-identical to the baseline form, so a
+        # ledger row written before this feature still replays after upgrade
+        # (its stored JSON lacks the keys and so does every new unordered call);
+        # old audit records are likewise never supplemented with ordering.
+        if partition_key is not None:
+            normalized["partitionKey"] = partition_key
+            normalized["sequence"] = sequence
         return normalized
 
     def get(self, instance_id: str) -> dict[str, Any]:
@@ -833,28 +945,36 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "events":
                     body = self._read_json()
                     if_match = parse_if_match(self.headers.get("If-Match"))
-                    if not isinstance(body, dict) or set(body) - {"outcome", "detail", "eventId"}:
+                    if not isinstance(body, dict) or set(body) - {"outcome", "detail", "eventId",
+                                                                  "partitionKey", "sequence"}:
                         raise InvalidRequest(
-                            'body must be {"outcome": "succeeded|failed|timed_out", "detail": ..., "eventId": "..."}'
+                            'body must be {"outcome": "succeeded|failed|timed_out", "detail": ..., '
+                            '"eventId": "...", "partitionKey": "...", "sequence": <int>}'
                         )
                     event_id = body["eventId"] if "eventId" in body else _UNSET
+                    partition_key = body["partitionKey"] if "partitionKey" in body else _UNSET
+                    sequence = body["sequence"] if "sequence" in body else _UNSET
                     return self._send(
                         200, engine.advance(parts[2], body.get("outcome"), body.get("detail"),
-                                            event_id, if_match)
+                                            event_id, if_match, partition_key, sequence)
                     )
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "signals":
                     body = self._read_json()
                     if_match = parse_if_match(self.headers.get("If-Match"))
-                    if not isinstance(body, dict) or set(body) - {"event", "detail", "eventId"}:
+                    if not isinstance(body, dict) or set(body) - {"event", "detail", "eventId",
+                                                                  "partitionKey", "sequence"}:
                         raise InvalidRequest(
-                            'body must be {"event": "<name>", "detail": ..., "eventId": "..."}'
+                            'body must be {"event": "<name>", "detail": ..., "eventId": "...", '
+                            '"partitionKey": "...", "sequence": <int>}'
                         )
                     if "event" not in body:
                         raise InvalidRequest('body must be {"event": "<name>", ...}')
                     event_id = body["eventId"] if "eventId" in body else _UNSET
+                    partition_key = body["partitionKey"] if "partitionKey" in body else _UNSET
+                    sequence = body["sequence"] if "sequence" in body else _UNSET
                     return self._send(
                         200, engine.signal(parts[2], body.get("event"), body.get("detail"),
-                                           event_id, if_match)
+                                           event_id, if_match, partition_key, sequence)
                     )
                 return self._send(404, {"error": {"code": "not_found"}})
             except SagaError as error:

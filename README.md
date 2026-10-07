@@ -40,6 +40,10 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
   版本随实例行持久化（`instances.instance_version` 列，旧文件自动 `ALTER TABLE` 补齐）；
   旧实例（无该列）按版本 **1** 读取，下一次真正变更后变为 **2**——不伪造历史变更次数。
   实例版本与“定义版本”（`workflowVersion`）相互独立。
+- **持久化分区顺序（可选）**：`/events` 与 `/signals` 可携带 `partitionKey`（1–100 字符非空字符串）与
+  `sequence`（正整数），且必须同时出现并带非空 `eventId` 才启用。分区按 **(工作流名, partitionKey)**
+  隔离、跨实例共享，事件与信号共用从 1 连续递增的游标（表 `partition_cursors`）；首个序号必须为 1，
+  之后严格 +1，跳号/旧号返回 `409 invalid_transition` 且不缓冲。详见接口节“持久化分区顺序”。
 - 状态转移是**纯函数**：同样的 `(状态, outcome, 当前时刻)` 永远得到同样的下一个状态。
 
 ## 接口
@@ -70,8 +74,10 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 版本不存在 ⇒ `404 not_found`；未知工作流（未指定版本）⇒ `400 invalid_request`。
 
 ### `POST /v1/instances/{id}/events`
-请求体：`{"outcome": "succeeded"|"failed"|"timed_out", "detail": <任意 JSON>, "eventId": "<可选>"}` →
-`200 {"id":..., "workflow":..., "workflowVersion":..., "state": {...}}`，成功响应（含幂等回放）带
+请求体：`{"outcome": "succeeded"|"failed"|"timed_out", "detail": <任意 JSON>, "eventId": "<可选>",
+"partitionKey": "<可选>", "sequence": <可选正整数>}` →
+`200 {"id":..., "workflow":..., "workflowVersion":..., "state": {...}}`（有序成功调用额外含
+`"ordering": {"partitionKey": ..., "sequence": ...}`，见“持久化分区顺序”），成功响应（含幂等回放）带
 **`ETag: "<当前实例版本>"`**。请求可带可选 **`If-Match: "<版本>"`** 前置条件（见下节“实例版本与 If-Match”）。
 - `succeeded`：推进到下一步（`attempt` 重置为 1，`failure` 清除）；已是最后一步 ⇒ `status="completed"`。
 - `failed`：
@@ -93,8 +99,10 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
   收到匹配信号、步骤推进之后，才能继续对新的当前步骤提交 `succeeded`/`failed`。
 
 ### `POST /v1/instances/{id}/signals`
-请求体：`{"event": "<事件名>", "detail": <任意 JSON>, "eventId": "<可选>"}` →
-`200 {"id":..., "workflow":..., "workflowVersion":..., "state": {...}}`，成功响应（含幂等回放）带
+请求体：`{"event": "<事件名>", "detail": <任意 JSON>, "eventId": "<可选>",
+"partitionKey": "<可选>", "sequence": <可选正整数>}` →
+`200 {"id":..., "workflow":..., "workflowVersion":..., "state": {...}}`（有序成功调用额外含
+`"ordering": {"partitionKey": ..., "sequence": ...}`，见“持久化分区顺序”），成功响应（含幂等回放）带
 **`ETag: "<当前实例版本>"`**；请求可带可选 **`If-Match`**（规则与 `/events` 完全一致）。
 - 仅当实例 `running` 且当前步骤 `waitingFor` 与 `event` 相同才接受：当前步骤按**成功结果**完成
   （`completed` 加入步骤名，`failure` 清除，`attempt` 重置为 1）并进入下一步；下一步仍带 `await`
@@ -140,6 +148,46 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
   旧实例为 `NULL`）；工作流定义随 `workflow_versions` 持久化，重开同一文件后自定义实例
   仍能拿到启动时的定义，版本归属与回放响应（含其中的 `workflowVersion`）保持不变。
 
+#### 持久化分区顺序（可选 `partitionKey`/`sequence`）
+`/events` 与 `/signals` 都可在事件幂等之上再启用**持久化分区顺序**。规则对两个入口完全一致：
+- **启用条件**：仅当请求**同时**携带 `partitionKey` 与 `sequence`，且携带非空 `eventId` 时启用；
+  不带任一字段、只给一个字段、或两个字段都给了但没有 `eventId`，均不启用。
+  - `partitionKey` 必须是 **1 到 100 字符的非空字符串**；
+  - `sequence` 必须是**正整数**（JSON 整数且 ≥ 1；布尔、小数、字符串、`0`、负数、`null` 均非法）；
+  - 上述任何非法形态（含只给一个字段或缺 `eventId`）⇒ **`400 invalid_request`**，不产生任何写入。
+- **分区与游标**：分区按 **(工作流名, partitionKey)** 隔离，**跨实例**共享；同一分区内
+  `/events` 与 `/signals` **共用一个从 1 连续递增的游标**（SQLite 表 `partition_cursors`，
+  每个分区一行）。不同工作流同名 partitionKey、或同一工作流不同 partitionKey 都是互不影响的独立分区。
+- **序号规则**：分区的首次有序调用 `sequence` 只能为 **1**；此后被接受的有序调用按游标 +1 连续占用。
+  - 跳号（游标为 n 却提交 n+2 或更大）、旧号（≤ n）⇒ **`409 invalid_transition`**；
+    **不缓冲、不重排**——乱序消息直接拒绝，客户端须以正确序号重发。
+  - 序号正确但状态机本身拒绝（终态推进、等待中提交事件、信号名不匹配、未到期 `timed_out` 等）
+    同样 ⇒ `409 invalid_transition`，且**不占用序号**：游标不变，下一次调用仍用该序号（可发给同分区另一实例）。
+  - 同分区并发时，**最多一个**调用取得当前序号；其余（即使 `eventId` 不同）得到 `409 invalid_transition`，
+    且不写账本、不追加审计。
+- **校验顺序**：有序调用在同一事务内依次判定 **① eventId 回放 → ② If-Match → ③ 序号 → ④ 状态机**：
+  - **回放优先**：同入口（同 `/events` 或同 `/signals`）内相同 `(实例, eventId)` 且归一化请求相同
+    （含 `partitionKey`/`sequence`、以及 `outcome` 或 `event`、`detail` 全部一致）的重试，
+    返回**首次 200 响应原文**（含首次的 `ordering` 与历史 `state`），不推进状态、不占序号、不追加审计，
+    即使携带的 `If-Match` 已过期或序号已是旧号。
+  - 相同 `eventId` 但载荷不同（`partitionKey`/`sequence`/`outcome`/`event`/`detail` 任一不同）
+    ⇒ **`409 invalid_transition`**（先于 If-Match 与序号判定）。
+  - 新 `eventId` 的 `If-Match` 失配 ⇒ `409 invalid_transition`（先于序号判定）；
+    If-Match 通过但序号失配 ⇒ `409 invalid_transition`。
+  - 所有拒绝都不改状态、实例版本、账本、审计与游标。
+- **成功语义**：序号正确且状态机接受的调用，在**同一事务**更新状态机、幂等账本、审计与分区游标，
+  实例版本照常 +1；成功响应新增 **`"ordering": {"partitionKey": <字符串>, "sequence": <整数>}`**。
+  回放响应保持首次响应（含首次 `ordering`）。
+- **不带排序字段的请求**完全保持原有返回、幂等、ETag、重试、等待、超时、迁移、补偿与审计行为，
+  归一化请求与响应均不含排序字段，**不创建任何分区记录**。
+- **审计**：`GET /v1/instances/{id}/audit` 中有序调用的 `request` 在原有字段之外保存
+  `partitionKey` 与 `sequence`，`response` 保存含 `ordering` 的完整首次响应；被拒绝的调用不记录，
+  升级前的旧记录不补顺序字段。
+- **持久化与旧库**：游标随同一 SQLite 文件持久化，重开后游标、账本与审计一致，分区从游标下一号继续。
+  旧文件以 `CREATE TABLE IF NOT EXISTS` 补建游标表（初始为空，不伪造历史），旧记录不补顺序，
+  新分区一律从 1 开始；升级前写入的无排序字段账本行，升级后仍按原样回放，不会被误判为载荷冲突。
+- 未知实例的有序调用仍返回 **`404 not_found`**（不创建分区行）；非法推进仍返回 `409 invalid_transition`。
+
 ### `GET /v1/instances/{id}`
 `200 {"id","workflow","workflowVersion","state"}`，并带响应头 **`ETag: "<实例版本>"`**；未知 id ⇒ `404 not_found`。
 `workflowVersion` 为实例固定的定义版本；版本化之前持久化的旧实例（SQLite 中无版本字段）返回
@@ -172,6 +220,8 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 - `request` 保存归一化输入（`eventId`/`outcome`/`detail` 或 `eventId`/`event`/`detail`）；
   未提交 `eventId` 时记录中的 `eventId` 为 `null`；省略 `detail` 与显式 `null` 都记为 `null`；
   被接受的 `timed_out` 以 `kind="event"`、`request.outcome="timed_out"` 记录，`seq` 连续递增。
+  有序调用（带 `partitionKey`/`sequence`，见“持久化分区顺序”）的 `request` 额外保存
+  `partitionKey` 与 `sequence`，其 `response` 含 `ordering`；无序调用与升级前旧记录均不含这些字段。
 - `response` 保存该次处理返回的完整 JSON 响应，无需重新执行状态机即可逐条核对当时结果。
 - 幂等回放（相同 `eventId` 相同载荷）仍只返回首次响应且只占一条审计记录，即使实例后来已终态；
   非法请求、相同 `eventId` 不同载荷、终态推进、等待期间提交事件、信号名不匹配等被拒绝的调用
@@ -217,5 +267,4 @@ Python 3.12，**仅标准库**；`127.0.0.1`；实例持久化在 sqlite（WAL �
 
 ## 未实现（后续任务候选，非固定题单）
 
-分区与顺序保证、
 持久化恢复与重放、限流与背压、可视化查询与审计回放、失败注入测试。
