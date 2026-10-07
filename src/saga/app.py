@@ -1011,6 +1011,83 @@ class Engine:
             revision,
         )
 
+    def audit_page(self, instance_id: str, limit: Any = None, after_seq: Any = None,
+                   kind: Any = None) -> dict[str, Any]:
+        """Read-only paginated audit view, entered when any query parameter is present.
+
+        ``limit``/``after_seq``/``kind`` are the raw (percent-decoded) query
+        literals, None when the caller omitted them. Validation runs before the
+        instance lookup, so a malformed query is 400 even for an unknown
+        instance and a valid query on an unknown instance is 404; either way
+        nothing is written.
+
+        * ``limit``: a decimal integer in 1..100 with no leading zeros,
+          defaulting to 50;
+        * ``after_seq``: a non-negative decimal integer with no leading zeros,
+          defaulting to 0 — an exclusive cursor on the full per-instance audit
+          sequence, so kind-filtered gaps still order by the original seq;
+        * ``kind``: ``event`` or ``signal``; omitted returns both kinds. The
+          filter only selects records, never rewrites their content.
+
+        The page carries ``limit`` records at most, ordered by seq ascending;
+        one extra row is fetched to decide ``nextSeq``, which is the seq of the
+        page's last record when further matching records exist beyond it and
+        None otherwise (an empty page yields an empty history and None).
+        """
+        if limit is None:
+            size = 50
+        else:
+            if (not isinstance(limit, str) or not limit or not limit.isascii()
+                    or not limit.isdigit() or (len(limit) > 1 and limit[0] == "0")):
+                raise InvalidRequest(
+                    "limit must be a decimal integer between 1 and 100 without leading zeros"
+                )
+            size = int(limit)
+            if not 1 <= size <= 100:
+                raise InvalidRequest("limit must be between 1 and 100")
+        if after_seq is None:
+            start = 0
+        else:
+            if (not isinstance(after_seq, str) or not after_seq or not after_seq.isascii()
+                    or not after_seq.isdigit()
+                    or (len(after_seq) > 1 and after_seq[0] == "0")):
+                raise InvalidRequest(
+                    "afterSeq must be a non-negative decimal integer without leading zeros"
+                )
+            start = int(after_seq)
+        if kind is not None and kind not in ("event", "signal"):
+            raise InvalidRequest("kind must be 'event' or 'signal'")
+        clauses = ["instance_id = ?", "seq > ?"]
+        params: list[Any] = [instance_id, start]
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        with self._lock:
+            row = self._db.execute(
+                "SELECT workflow, state, version, instance_version FROM instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
+            if row is None:
+                raise InstanceNotFound(f"no instance {instance_id}")
+            rows = self._db.execute(
+                f"SELECT seq, kind, event_id, request, response FROM instance_audit "
+                f"WHERE {' AND '.join(clauses)} ORDER BY seq LIMIT ?",
+                (*params, size + 1),
+            ).fetchall()
+        page = rows[:size]
+        history = [
+            {"seq": seq, "kind": record_kind, "eventId": event_id,
+             "request": json.loads(request), "response": json.loads(response)}
+            for seq, record_kind, event_id, request, response in page
+        ]
+        next_seq = page[-1][0] if len(rows) > size else None
+        revision = row[3] if row[3] is not None else 1
+        return _RevisionedResponse(
+            {"id": instance_id, "workflow": row[0], "workflowVersion": row[2],
+             "state": _read_state(row[1]), "history": history, "nextSeq": next_seq},
+            revision,
+        )
+
 
 def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
@@ -1076,6 +1153,34 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                 "limit": params.get("limit"),
             }
 
+        def _audit_query_args(self) -> dict[str, Any] | None:
+            """Query arguments for GET /v1/instances/{id}/audit.
+
+            Returns None when the query string carries no parameters at all:
+            the call keeps the baseline unpaginated shape. As soon as any
+            parameter appears the call enters paged mode; only
+            limit/afterSeq/kind are known, and a repeated or unknown
+            parameter is 400. Values are handed to the engine as raw
+            (percent-decoded) strings; shape validation happens there,
+            before the instance lookup.
+            """
+            query = self.path.partition("?")[2]
+            pairs = parse_qsl(query, keep_blank_values=True)
+            if not pairs:
+                return None
+            names = [name for name, _ in pairs]
+            if len(set(names)) != len(names):
+                raise InvalidRequest("query parameters must not be repeated")
+            unknown = sorted(set(names) - {"limit", "afterSeq", "kind"})
+            if unknown:
+                raise InvalidRequest(f"unknown query parameters: {unknown}")
+            params = dict(pairs)
+            return {
+                "limit": params.get("limit"),
+                "after_seq": params.get("afterSeq"),
+                "kind": params.get("kind"),
+            }
+
         def do_GET(self) -> None:  # noqa: N802
             try:
                 parts = self._parts()
@@ -1090,7 +1195,10 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                 if len(parts) == 3 and parts[:2] == ["v1", "instances"]:
                     return self._send(200, engine.get(parts[2]))
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "audit":
-                    return self._send(200, engine.audit(parts[2]))
+                    audit_args = self._audit_query_args()
+                    if audit_args is None:
+                        return self._send(200, engine.audit(parts[2]))
+                    return self._send(200, engine.audit_page(parts[2], **audit_args))
                 return self._send(404, {"error": {"code": "not_found"}})
             except SagaError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
