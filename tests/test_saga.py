@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sqlite3
 import tempfile
 import threading
@@ -11,7 +12,7 @@ import unittest
 import urllib.error
 import urllib.request
 
-from saga import Engine, InstanceNotFound, InvalidRequest, InvalidTransition, NotFound, SagaError, WORKFLOWS, apply_outcome, apply_recover, apply_signal, initial_state, parse_if_match
+from saga import Engine, InstanceNotFound, InvalidRequest, InvalidTransition, NotFound, RateLimiter, SagaError, WORKFLOWS, apply_outcome, apply_recover, apply_signal, initial_state, parse_if_match
 
 
 class TransitionUnitTests(unittest.TestCase):
@@ -68,6 +69,10 @@ class HttpSurfaceTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
+
+    def setUp(self) -> None:
+        # The mutation limiter is process-local; each test starts a fresh window.
+        self.server.rate_limiter.reset()
 
     def call(self, method: str, path: str, body: dict | None = None):
         data = None if body is None else json.dumps(body).encode()
@@ -348,6 +353,10 @@ class IdempotencyHttpTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
 
+    def setUp(self) -> None:
+        # The mutation limiter is process-local; each test starts a fresh window.
+        self.server.rate_limiter.reset()
+
     def call(self, method: str, path: str, body: dict | None = None):
         data = None if body is None else json.dumps(body).encode()
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
@@ -584,6 +593,10 @@ class RetryHttpTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
+
+    def setUp(self) -> None:
+        # The mutation limiter is process-local; each test starts a fresh window.
+        self.server.rate_limiter.reset()
 
     def call(self, method: str, path: str, body: dict | None = None):
         data = None if body is None else json.dumps(body).encode()
@@ -1002,6 +1015,10 @@ class AwaitHttpTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
 
+    def setUp(self) -> None:
+        # The mutation limiter is process-local; each test starts a fresh window.
+        self.server.rate_limiter.reset()
+
     def call(self, method: str, path: str, body: dict | None = None):
         data = None if body is None else json.dumps(body).encode()
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
@@ -1295,6 +1312,10 @@ class AuditHttpTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
 
+    def setUp(self) -> None:
+        # The mutation limiter is process-local; each test starts a fresh window.
+        self.server.rate_limiter.reset()
+
     def call(self, method: str, path: str, body: dict | None = None):
         data = None if body is None else json.dumps(body).encode()
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
@@ -1469,6 +1490,10 @@ class AuditPagingHttpTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
+
+    def setUp(self) -> None:
+        # The mutation limiter is process-local; each test starts a fresh window.
+        self.server.rate_limiter.reset()
 
     def call(self, method: str, path: str, body: dict | None = None):
         data = None if body is None else json.dumps(body).encode()
@@ -1789,6 +1814,10 @@ class TimelineHttpTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
+
+    def setUp(self) -> None:
+        # The mutation limiter is process-local; each test starts a fresh window.
+        self.server.rate_limiter.reset()
 
     def call(self, method: str, path: str, body: dict | None = None):
         data = None if body is None else json.dumps(body).encode()
@@ -2251,6 +2280,10 @@ class TimeoutHttpTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
 
+    def setUp(self) -> None:
+        # The mutation limiter is process-local; each test starts a fresh window.
+        self.server.rate_limiter.reset()
+
     def call(self, method: str, path: str, body: dict | None = None):
         data = None if body is None else json.dumps(body).encode()
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
@@ -2644,6 +2677,10 @@ class VersionHttpTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
+
+    def setUp(self) -> None:
+        # The mutation limiter is process-local; each test starts a fresh window.
+        self.server.rate_limiter.reset()
 
     def call(self, method: str, path: str, body: dict | None = None):
         data = None if body is None else json.dumps(body).encode()
@@ -3079,6 +3116,10 @@ class InstanceRevisionHttpTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
+
+    def setUp(self) -> None:
+        # The mutation limiter is process-local; each test starts a fresh window.
+        self.server.rate_limiter.reset()
 
     def call(self, method: str, path: str, body: dict | None = None, headers: dict | None = None):
         data = None if body is None else json.dumps(body).encode()
@@ -3681,6 +3722,10 @@ class PartitionOrderingHttpTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
 
+    def setUp(self) -> None:
+        # The mutation limiter is process-local; each test starts a fresh window.
+        self.server.rate_limiter.reset()
+
     def call(self, method: str, path: str, body: dict | None = None, headers: dict | None = None):
         data = None if body is None else json.dumps(body).encode()
         hdrs = {"Content-Type": "application/json"}
@@ -4249,6 +4294,10 @@ class RecoverHttpTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
 
+    def setUp(self) -> None:
+        # The mutation limiter is process-local; each test starts a fresh window.
+        self.server.rate_limiter.reset()
+
     def call(self, method: str, path: str, body=b"", headers: dict | None = None):
         if body == b"":
             data = b""
@@ -4549,6 +4598,10 @@ class ListInstancesHttpTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
 
+    def setUp(self) -> None:
+        # The mutation limiter is process-local; each test starts a fresh window.
+        self.server.rate_limiter.reset()
+
     def call(self, method: str, path: str, body: dict | None = None):
         data = None if body is None else json.dumps(body).encode()
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
@@ -4774,6 +4827,10 @@ class MigrationPlanHttpTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
 
+    def setUp(self) -> None:
+        # The mutation limiter is process-local; each test starts a fresh window.
+        self.server.rate_limiter.reset()
+
     def call(self, method: str, path: str, body: dict | None = None):
         data = None if body is None else json.dumps(body).encode()
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data,
@@ -4868,6 +4925,433 @@ class MigrationPlanHttpTests(unittest.TestCase):
         # The rejections wrote nothing: the instance is still at revision 1.
         _, _, headers = self.call("GET", f"/v1/instances/{iid}")
         self.assertEqual(headers.get("ETag"), '"1"')
+
+
+class RateLimiterUnitTests(unittest.TestCase):
+    """Direct coverage of the process-local fixed-window limiter."""
+
+    def test_window_is_epoch_ms_integer_divided_by_1000(self) -> None:
+        ticks = iter([1234, 999, 1000, 1500])
+        limiter = RateLimiter(clock=lambda: next(ticks))
+        admitted, remaining, reset_ms, retry_after = limiter.take("ip")
+        self.assertTrue(admitted)
+        self.assertEqual((remaining, reset_ms, retry_after), (19, 2000, 1))
+        # 999 is the previous window: its counter rolled over and is fresh.
+        admitted, remaining, reset_ms, _ = limiter.take("ip")
+        self.assertEqual((admitted, remaining, reset_ms), (True, 19, 1000))
+        # 1000 opens window 1, again fresh.
+        admitted, remaining, reset_ms, _ = limiter.take("ip")
+        self.assertEqual((admitted, remaining, reset_ms), (True, 19, 2000))
+        # 1500 stays in window 1 and shares that window's counter (second call).
+        admitted, remaining, reset_ms, _ = limiter.take("ip")
+        self.assertEqual((admitted, remaining, reset_ms), (True, 18, 2000))
+
+    def test_first_limit_admitted_then_rejected_with_remaining_clamped(self) -> None:
+        ticks = iter([1000] * 25)
+        limiter = RateLimiter(clock=lambda: next(ticks))
+        results = [limiter.take("ip") for _ in range(25)]
+        self.assertTrue(all(r[0] for r in results[:20]))
+        self.assertEqual([r[1] for r in results[:20]], list(range(19, -1, -1)))
+        self.assertFalse(any(r[0] for r in results[20:]))
+        self.assertTrue(all(r[1] == 0 for r in results[20:]))
+        self.assertTrue(all(r[2] == 2000 for r in results))
+        # Rejected callers always get an integer Retry-After of at least 1.
+        self.assertTrue(all(r[3] >= 1 for r in results[20:]))
+
+    def test_window_rollover_refreshes_the_budget(self) -> None:
+        ticks = iter([1000] * 20 + [1999, 2000])
+        limiter = RateLimiter(clock=lambda: next(ticks))
+        for _ in range(20):
+            self.assertTrue(limiter.take("ip")[0])
+        self.assertFalse(limiter.take("ip")[0])  # 1999, same window
+        admitted, remaining, reset_ms, _ = limiter.take("ip")  # 2000, new window
+        self.assertEqual((admitted, remaining, reset_ms), (True, 19, 3000))
+
+    def test_budgets_are_per_source(self) -> None:
+        ticks = iter([1000] * 50)
+        limiter = RateLimiter(clock=lambda: next(ticks))
+        for _ in range(20):
+            self.assertTrue(limiter.take("a")[0])
+        self.assertFalse(limiter.take("a")[0])
+        # A different source IP has its own untouched window.
+        admitted, remaining, _, _ = limiter.take("b")
+        self.assertEqual((admitted, remaining), (True, 19))
+        for _ in range(19):
+            self.assertTrue(limiter.take("b")[0])
+        self.assertFalse(limiter.take("b")[0])
+
+    def test_retry_after_is_ceil_seconds_to_next_window(self) -> None:
+        limiter = RateLimiter(window_ms=5000, clock=iter([1, 4500, 5000]).__next__)
+        self.assertEqual(limiter.take("ip")[3], 5)   # 4999 ms left -> ceil 5 s
+        self.assertEqual(limiter.take("ip")[3], 1)   # 500 ms left -> ceil 1 s
+        self.assertEqual(limiter.take("ip")[3], 5)   # new window, 5000 ms left
+
+    def test_reset_clears_every_counter(self) -> None:
+        ticks = iter([1000] * 25)
+        limiter = RateLimiter(clock=lambda: next(ticks))
+        for _ in range(20):
+            limiter.take("ip")
+        self.assertFalse(limiter.take("ip")[0])
+        limiter.reset()
+        admitted, remaining, _, _ = limiter.take("ip")
+        self.assertEqual((admitted, remaining), (True, 19))
+
+    def test_concurrent_callers_admit_at_most_the_limit(self) -> None:
+        limiter = RateLimiter()
+        barrier = threading.Barrier(64)
+
+        def consume() -> None:
+            barrier.wait()
+            results.append(limiter.take("ip"))
+
+        results: list[tuple[bool, int, int, int]] = []
+        threads = [threading.Thread(target=consume) for _ in range(64)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(1 for r in results if r[0]), 20)
+        self.assertEqual(sum(1 for r in results if not r[0]), 44)
+        admitted_remaining = sorted(r[1] for r in results if r[0])
+        self.assertEqual(admitted_remaining, list(range(0, 20)))
+
+
+class RateLimitHttpTests(unittest.TestCase):
+    """End-to-end coverage of the per-source-IP mutation quota."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from saga import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def setUp(self) -> None:
+        self.server.rate_limiter.reset()
+
+    def _freeze_clock(self, ms: int) -> dict:
+        """Pin the limiter's clock at *ms* so quota tests never straddle a
+        real calendar-second boundary mid-burst. Returns a holder whose
+        ``"v"`` the test can advance to move the fixed window on."""
+        limiter = self.server.rate_limiter
+        holder = {"v": ms}
+        self.addCleanup(setattr, limiter, "_clock", limiter._clock)
+        limiter._clock = lambda: holder["v"]
+        limiter.reset()
+        return holder
+
+    def call(self, method: str, path: str, body=b"", headers: dict | None = None):
+        if body == b"":
+            data = b""
+        else:
+            data = json.dumps(body).encode()
+        hdrs = {"Content-Type": "application/json"}
+        if headers:
+            hdrs.update(headers)
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data,
+                                         method=method, headers=hdrs)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}"), response.headers
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}"), error.headers
+
+    def raw(self, path: str, raw_body: bytes = b"", *, length: str | None = "auto",
+            extra_headers: str = ""):
+        """Send one raw HTTP/1.1 request with manually controlled framing.
+
+        ``length="auto"`` sends the correct Content-Length; ``length=None``
+        omits the header; any other value sends it verbatim. Lets the syntax
+        tests reach malformed Content-Length / body shapes directly.
+        """
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as conn:
+            request_lines = [f"POST {path} HTTP/1.1", "Host: x"]
+            if length is not None:
+                value = len(raw_body) if length == "auto" else length
+                request_lines.append(f"Content-Length: {value}")
+            if extra_headers:
+                request_lines.append(extra_headers)
+            conn.sendall(("\r\n".join(request_lines) + "\r\n\r\n").encode() + raw_body)
+            received = b""
+            while b"\r\n\r\n" not in received:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                received += chunk
+            head, _, body_start = received.partition(b"\r\n\r\n")
+            headers: dict[str, str] = {}
+            for line in head.split(b"\r\n")[1:]:
+                key, _, value = line.partition(b":")
+                headers[key.decode().strip()] = value.decode().strip()
+            body = body_start
+            expected = int(headers.get("Content-Length", "0"))
+            while len(body) < expected:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                body += chunk
+        status = int(head.split(b"\r\n", 1)[0].split()[1])
+        return status, json.loads(body or b"{}"), headers
+
+    def _burn(self, count: int) -> None:
+        """Spend *count* units on routed writes that change nothing (all 400)."""
+        for _ in range(count):
+            status, _, headers = self.call("PUT", "/v1/workflows/quota-filler",
+                                           {"steps": []})
+            self.assertEqual(status, 400)
+            self.assertIn("RateLimit-Remaining", headers)
+
+    def test_headers_on_first_write_and_fixed_window_values(self) -> None:
+        now = int(time.time() * 1000)
+        status, body, headers = self.call("PUT", "/v1/workflows/rl-head",
+                                          {"steps": [{"name": "s1"}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("RateLimit-Limit"), "20")
+        self.assertEqual(headers.get("RateLimit-Remaining"), "19")
+        reset_ms = int(headers.get("RateLimit-Reset"))
+        # Reset is the next window boundary; tolerate the call straddling one.
+        expected = (now // 1000 + 1) * 1000
+        self.assertIn(reset_ms, (expected, expected + 1000))
+        self.assertGreater(reset_ms, now - 1000)
+        self.assertNotIn("Retry-After", headers)
+
+    def test_first_twenty_admitted_twenty_first_is_429_with_fixed_body(self) -> None:
+        self._freeze_clock(1000)
+        statuses = []
+        # The 20 units are spent across several different write endpoints;
+        # business 400s and 404s spend a unit just like successes.
+        for i in range(7):
+            statuses.append(self.call("PUT", "/v1/workflows/rl-burst",
+                                      {"steps": []})[0])
+        statuses.append(self.call("POST", "/v1/workflows/unknown-xyz/instances", {})[0])
+        start_status, start_body, _ = self.call("POST", "/v1/workflows/order/instances", {})
+        statuses.append(start_status)
+        iid = start_body["id"]
+        statuses.append(self.call("POST", f"/v1/instances/{iid}/events",
+                                  {"outcome": "nope"})[0])
+        statuses.append(self.call("POST", f"/v1/instances/missing/events",
+                                  {"outcome": "succeeded"})[0])
+        status, body, headers = self.call("POST", f"/v1/instances/{iid}/events",
+                                          {"outcome": "succeeded", "eventId": "e1"})
+        statuses.append(status)
+        # An eventId replay spends a unit and returns the first response.
+        replay_status, replay, replay_headers = self.call(
+            "POST", f"/v1/instances/{iid}/events",
+            {"outcome": "succeeded", "eventId": "e1"})
+        statuses.append(replay_status)
+        self.assertEqual(replay["state"]["status"], "running")
+        # Same eventId with a different payload: 409, still spends a unit.
+        conflict = self.call("POST", f"/v1/instances/{iid}/events",
+                             {"outcome": "failed", "eventId": "e1"})
+        statuses.append(conflict[0])
+        self.assertEqual(conflict[2].get("RateLimit-Remaining"), "6")
+        # A stale If-Match is 409 and spends a unit too.
+        stale = self.call("POST", f"/v1/instances/{iid}/events",
+                          {"outcome": "succeeded"}, {"If-Match": '"99"'})
+        statuses.append(stale[0])
+        self.assertEqual(stale[2].get("RateLimit-Remaining"), "5")
+        # An ordered sequence gap is a business 409 spending a unit.
+        gap = self.call("POST", f"/v1/instances/{iid}/events",
+                        {"outcome": "succeeded", "eventId": "g1",
+                         "partitionKey": "p", "sequence": 2})
+        statuses.append(gap[0])
+        self.assertEqual(gap[2].get("RateLimit-Remaining"), "4")
+        # 4 more routed writes leave the window full.
+        for expected_remaining in (3, 2, 1, 0):
+            status, _, headers = self.call("POST", "/v1/instances/missing/recover", {})
+            statuses.append(status)
+            self.assertEqual(headers.get("RateLimit-Remaining"),
+                             str(expected_remaining))
+        reset_of_full_window = headers.get("RateLimit-Reset")
+        self.assertEqual(len(statuses), 20)
+        self.assertNotIn(429, statuses)
+        # The 21st write from this IP is refused, whatever the endpoint.
+        status, body, headers = self.call("POST", f"/v1/instances/{iid}/events",
+                                          {"outcome": "succeeded"})
+        self.assertEqual(status, 429)
+        self.assertEqual(body, {"error": {"code": "rate_limited",
+                                          "message": "mutation rate limit exceeded"}})
+        self.assertEqual(headers.get("RateLimit-Limit"), "20")
+        self.assertEqual(headers.get("RateLimit-Remaining"), "0")
+        # Same fixed window as the 20th admitted call; its boundary is in the future.
+        self.assertEqual(headers.get("RateLimit-Reset"), reset_of_full_window)
+        self.assertEqual(headers.get("RateLimit-Reset"), "2000")
+        self.assertEqual(headers.get("Retry-After"), "1")
+        self.assertIsNone(headers.get("ETag"))
+
+    def test_each_write_endpoint_admits_at_twentieth_then_429(self) -> None:
+        self._freeze_clock(1000)
+        endpoints = [
+            ("PUT", "/v1/workflows/rl-each", {"steps": [{"name": "s1"}]}, None),
+            ("POST", "/v1/workflows/order/instances", {}, None),
+            ("POST", "/v1/instances/missing/events",
+             {"outcome": "succeeded"}, None),
+            ("POST", "/v1/instances/missing/signals",
+             {"event": "go"}, None),
+            ("POST", "/v1/instances/missing/migrate",
+             {"version": 1}, None),
+            ("POST", "/v1/instances/missing/recover", {}, None),
+        ]
+        for index, (method, path, body, extra_headers) in enumerate(endpoints):
+            self.server.rate_limiter.reset()
+            self._burn(19)
+            status, _, headers = self.call(method, path, body, extra_headers)
+            self.assertNotEqual(status, 429, path)
+            self.assertEqual(headers.get("RateLimit-Remaining"), "0", path)
+            self.assertEqual(headers.get("RateLimit-Limit"), "20", path)
+            status, body429, headers429 = self.call(method, path, body, extra_headers)
+            self.assertEqual(status, 429, path)
+            self.assertEqual(body429["error"]["code"], "rate_limited", path)
+            self.assertEqual(headers429.get("Retry-After"), "1", path)
+
+    def test_syntax_errors_are_400_without_spending_a_unit_or_headers(self) -> None:
+        def assert_exempt(status, body, headers, label: str) -> None:
+            self.assertEqual(status, 400, label)
+            self.assertEqual(body["error"]["code"], "invalid_request", label)
+            self.assertNotIn("RateLimit-Limit", headers, label)
+            self.assertNotIn("RateLimit-Remaining", headers, label)
+            self.assertNotIn("Retry-After", headers, label)
+
+        # Malformed JSON body (valid framing).
+        assert_exempt(*self.raw("/v1/instances/x/events", b"{not json}"), "malformed json")
+        # Invalid UTF-8.
+        assert_exempt(*self.raw("/v1/instances/x/events", b"\xff\xfe"), "bad utf8")
+        # Missing Content-Length.
+        assert_exempt(*self.raw("/v1/instances/x/events", length=None), "no content-length")
+        # Non-integer Content-Length.
+        assert_exempt(*self.raw("/v1/instances/x/events", b"{}", length="abc"),
+                      "bad content-length")
+        # Malformed If-Match on a write that accepts it.
+        assert_exempt(*self.call("POST", "/v1/instances/x/recover", {},
+                                 {"If-Match": "1"})[:3], "bad if-match")
+        # Nothing was spent: the next well-formed write still sees 19 left.
+        status, _, headers = self.call("PUT", "/v1/workflows/rl-syntax",
+                                       {"steps": [{"name": "s1"}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("RateLimit-Remaining"), "19")
+
+    def test_rejected_writes_have_no_side_effects(self) -> None:
+        self._freeze_clock(1000)
+        iid = self.call("POST", "/v1/workflows/order/instances", {})[1]["id"]
+        # Burn the window with 19 more units (one was spent starting the instance).
+        self._burn(19)
+        # Every following write is a 429 and changes nothing.
+        self.assertEqual(self.call("POST", "/v1/workflows/order/instances", {})[0], 429)
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/events",
+                                   {"outcome": "succeeded"})[0], 429)
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/signals",
+                                   {"event": "go"})[0], 429)
+        self.assertEqual(self.call("PUT", "/v1/workflows/order",
+                                   {"steps": [{"name": "s1"}]})[0], 429)
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/migrate",
+                                   {"version": 1})[0], 429)
+        self.assertEqual(self.call("POST", f"/v1/instances/{iid}/recover",
+                                   {})[0], 429)
+        # No instance created, no step advanced (revision stayed 1), and the
+        # rejected eventId cannot replay later as an accepted first response.
+        _, current, headers = self.call("GET", f"/v1/instances/{iid}")
+        self.assertEqual(current["state"]["status"], "running")
+        self.assertEqual(current["state"]["index"], 0)
+        self.assertEqual(headers.get("ETag"), '"1"')
+
+    def test_reads_and_unknown_routes_carry_no_rate_headers_and_spend_nothing(self) -> None:
+        read_paths = ["/health", "/v1/workflows", "/v1/workflows/order",
+                      "/v1/instances", "/v1/instances/missing",
+                      "/v1/instances/missing/audit",
+                      "/v1/instances/missing/timeline",
+                      "/v1/instances/missing/migration-plan?targetVersion=1"]
+        for path in read_paths:
+            _, _, headers = self.call("GET", path)
+            self.assertNotIn("RateLimit-Limit", headers, path)
+            self.assertNotIn("RateLimit-Remaining", headers, path)
+        # Unknown routes stay plain 404s with no rate headers on any verb.
+        for method, path in (("PUT", "/v1/nope"), ("PUT", "/v1/workflows"),
+                             ("POST", "/v1/nope"), ("POST", "/v1/instances"),
+                             ("GET", "/v1/unknown")):
+            status, body, headers = self.call(method, path, {})
+            self.assertEqual(status, 404, (method, path))
+            self.assertEqual(body["error"]["code"], "not_found")
+            self.assertNotIn("RateLimit-Limit", headers, path)
+        # All those calls were free: the first write still sees 19 units left.
+        _, _, headers = self.call("PUT", "/v1/workflows/rl-reads",
+                                  {"steps": [{"name": "s1"}]})
+        self.assertEqual(headers.get("RateLimit-Remaining"), "19")
+
+    def test_budget_refreshes_in_the_next_fixed_window(self) -> None:
+        clock = self._freeze_clock(1000)
+        self._burn(20)
+        status, _, headers = self.call("PUT", "/v1/workflows/rl-window",
+                                       {"steps": [{"name": "s1"}]})
+        self.assertEqual(status, 429)
+        self.assertEqual(headers.get("RateLimit-Reset"), "2000")
+        # Advance to the next fixed window (epoch_ms // 1000 == 2): the budget
+        # is fresh again and Reset points one window further on.
+        clock["v"] = 2000
+        status, _, headers = self.call("PUT", "/v1/workflows/rl-window",
+                                       {"steps": [{"name": "s1"}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("RateLimit-Remaining"), "19")
+        self.assertEqual(headers.get("RateLimit-Reset"), "3000")
+
+    def test_concurrent_burst_admits_exactly_twenty(self) -> None:
+        # Pin the clock inside one fixed window so thread scheduling can never
+        # straddle a real second boundary; the handler closes over the same
+        # limiter object, so swapping its clock is enough.
+        self._freeze_clock(1000)
+        # Connections are established one at a time (the server's listen
+        # backlog is small); the HTTP requests themselves are released
+        # together at the barrier, which is the atomic gate under test.
+        request_bytes = (
+            b"POST /v1/workflows/order/instances HTTP/1.1\r\n"
+            b"Host: x\r\nContent-Type: application/json\r\n"
+            b"Content-Length: 2\r\nConnection: close\r\n\r\n{}"
+        )
+        sockets = []
+        for _ in range(40):
+            conn = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            sockets.append(conn)
+            time.sleep(0.002)
+        barrier = threading.Barrier(40)
+        responses: list[tuple[int, dict]] = []
+
+        def burst(conn: socket.socket) -> None:
+            barrier.wait()
+            conn.sendall(request_bytes)
+            chunks = []
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+            head, _, body = raw.partition(b"\r\n\r\n")
+            status = int(head.split(b"\r\n", 1)[0].split()[1])
+            responses.append((status, json.loads(body)))
+
+        threads = [threading.Thread(target=burst, args=(conn,)) for conn in sockets]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        for conn in sockets:
+            conn.close()
+        admitted = [r for r in responses if r[0] == 201]
+        refused = [r for r in responses if r[0] == 429]
+        self.assertEqual(len(responses), 40)
+        self.assertEqual(len(admitted), 20)
+        self.assertEqual(len(refused), 20)
+        self.assertTrue(all(body["error"]["code"] == "rate_limited" for _, body in refused))
+        # The 20 admitted calls created exactly 20 distinct instances; the 20
+        # refused calls created nothing.
+        created = {body["id"] for _, body in admitted}
+        self.assertEqual(len(created), 20)
+        for iid in created:
+            self.assertEqual(self.call("GET", f"/v1/instances/{iid}")[0], 200)
 
 
 if __name__ == "__main__":
