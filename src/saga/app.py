@@ -6,6 +6,7 @@ in reverse order when a later step fails.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -1256,7 +1257,98 @@ class Engine:
         return _RevisionedResponse(body, revision)
 
 
-def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
+class RateLimiter:
+    """Process-local fixed-window counter for mutating HTTP calls, per source IP.
+
+    A window is the Unix epoch milliseconds divided by 1000 floored to an int;
+    each source gets at most :data:`LIMIT` admitted writes per window. State is
+    held only in memory, so a restart recounts from zero — nothing is persisted
+    and no SQLite table or row is involved. Judgment is atomic under one lock:
+    concurrent writes in the same window are serialized through :meth:`acquire`
+    and at most ``LIMIT`` of them proceed, regardless of arrival timing.
+    """
+
+    #: Allowed mutating calls per source per 1000 ms window.
+    LIMIT = 20
+    #: Window size in milliseconds.
+    WINDOW_MS = 1000
+
+    def __init__(self, clock: Any | None = None) -> None:
+        # Injectable clock (returns epoch ms) keeps window-rollover tests
+        # deterministic; production uses the wall clock. State is memory-only.
+        self._clock = clock or _now_ms
+        self._lock = threading.Lock()
+        # source IP -> {"window": <epoch ms // 1000>, "used": <admitted count>}
+        self._buckets: dict[str, dict[str, int]] = {}
+
+    def reset(self) -> None:
+        """Forget every source's counters (test support; mirrors a process restart)."""
+        with self._lock:
+            self._buckets.clear()
+
+    def now_ms(self) -> int:
+        """The limiter's current time (injectable clock)."""
+        return self._clock()
+
+    @staticmethod
+    def window_for(now_ms: int) -> int:
+        """The fixed window containing *now_ms*: epoch milliseconds floored per second."""
+        return now_ms // RateLimiter.WINDOW_MS
+
+    @staticmethod
+    def reset_ms(window: int) -> int:
+        """Unix epoch milliseconds of the first millisecond of the next window."""
+        return (window + 1) * RateLimiter.WINDOW_MS
+
+    @staticmethod
+    def retry_after_seconds(reset_ms: int, now_ms: int) -> int:
+        """Whole seconds until the next window starts, rounded up, at least 1."""
+        return max(1, math.ceil((reset_ms - now_ms) / RateLimiter.WINDOW_MS))
+
+    def observe(self, source: str, now_ms: int | None = None) -> tuple[bool, int, int]:
+        """Read the current admission state **without charging** a unit.
+
+        Returns ``(admitted, remaining, reset_ms)`` with ``remaining`` the quota
+        the window still holds before any charge (a syntactically invalid write
+        consumes nothing, so its ``RateLimit-Remaining`` reports this value).
+        """
+        if now_ms is None:
+            now_ms = self._clock()
+        window = self.window_for(now_ms)
+        with self._lock:
+            bucket = self._buckets.get(source)
+            used = bucket["used"] if bucket is not None and bucket["window"] == window else 0
+        return used < self.LIMIT, max(0, self.LIMIT - used), self.reset_ms(window)
+
+    def acquire(self, source: str, now_ms: int | None = None) -> tuple[bool, int, int]:
+        """Atomically judge one syntactically valid mutating call and charge one unit.
+
+        Returns ``(admitted, remaining, reset_ms)``: ``remaining`` is the window
+        quota left **after** this call's unit is charged (zero when the call took
+        the last unit); on rejection it is zero and no counter moves. Concurrent
+        callers are judged one at a time, so at most ``LIMIT`` calls per source
+        per window are ever admitted.
+        """
+        if now_ms is None:
+            now_ms = self._clock()
+        window = self.window_for(now_ms)
+        with self._lock:
+            bucket = self._buckets.get(source)
+            if bucket is None or bucket["window"] != window:
+                # First sighting this window: a stale bucket from an earlier
+                # window is simply replaced, no background cleanup required.
+                bucket = {"window": window, "used": 0}
+                self._buckets[source] = bucket
+            if bucket["used"] >= self.LIMIT:
+                return False, 0, self.reset_ms(window)
+            bucket["used"] += 1
+            return True, self.LIMIT - bucket["used"], self.reset_ms(window)
+
+
+def make_handler(engine: Engine, rate_limiter: RateLimiter | None = None) -> type[BaseHTTPRequestHandler]:
+    if rate_limiter is None:
+        rate_limiter = RateLimiter()
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "saga/0.1"
         protocol_version = "HTTP/1.1"
@@ -1264,7 +1356,8 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
         def log_message(self, *args: Any) -> None:
             return
 
-        def _send(self, status: int, body: dict[str, Any]) -> None:
+        def _send(self, status: int, body: dict[str, Any],
+                  rate: tuple[int, int] | None = None, retry_after: int = 0) -> None:
             raw = json.dumps(body).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -1273,9 +1366,47 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
             revision = getattr(body, "revision", None)
             if isinstance(revision, int):
                 self.send_header("ETag", f'"{revision}"')
+            # Every response from a matched mutating entry carries the window
+            # state, including its 400/404/409 rejections; reads and unknown
+            # paths carry no rate-limit headers at all.
+            if rate is not None:
+                remaining, reset_ms = rate
+                self.send_header("RateLimit-Limit", str(RateLimiter.LIMIT))
+                self.send_header("RateLimit-Remaining", str(remaining))
+                self.send_header("RateLimit-Reset", str(reset_ms))
+            if retry_after:
+                self.send_header("Retry-After", str(retry_after))
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
+
+        def _source_ip(self) -> str:
+            # The direct peer is the rate-limit principal: no proxy headers are
+            # trusted, so a client cannot pick a bucket via X-Forwarded-For.
+            return self.client_address[0]
+
+        def _admit(self) -> tuple[bool, tuple[int, int], int]:
+            """Atomically charge one syntactically valid mutating call.
+
+            Returns ``(admitted, rate_headers, retry_after)``; on rejection
+            ``rate_headers`` is ``(0, reset_ms)`` and ``retry_after`` is the
+            whole-second wait rounded up to the next window (at least 1).
+            The clock is read once, so the judgment and the Retry-After
+            calculation share one instant even at a window boundary.
+            """
+            now = rate_limiter.now_ms()
+            admitted, remaining, reset_ms = rate_limiter.acquire(
+                self._source_ip(), now
+            )
+            if admitted:
+                return True, (remaining, reset_ms), 0
+            return False, (0, reset_ms), rate_limiter.retry_after_seconds(reset_ms, now)
+
+        def _observe_rate(self) -> tuple[int, int]:
+            """Window headers for a write whose request syntax was invalid:
+            nothing is charged, so Remaining reflects the window as-is."""
+            _, remaining, reset_ms = rate_limiter.observe(self._source_ip())
+            return remaining, reset_ms
 
         def _read_json(self) -> Any:
             length = self.headers.get("Content-Length")
@@ -1411,42 +1542,95 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                 return self._send(500, {"error": {"code": "internal_error"}})
 
         def do_PUT(self) -> None:  # noqa: N802
+            rate: tuple[int, int] | None = None
             try:
                 parts = self._parts()
                 if len(parts) != 3 or parts[:2] != ["v1", "workflows"]:
+                    # Unknown path: plain 404, no charge, no rate-limit headers.
                     return self._send(404, {"error": {"code": "not_found"}})
-                workflow = engine.define(parts[2], self._read_json())
+                # Request syntax is parsed first; a malformed body is 400 and
+                # consumes no quota.
+                payload = self._read_json()
+                # A syntactically complete write is judged atomically and always
+                # consumes one unit, whatever the business layer later decides.
+                admitted, rate, retry_after = self._admit()
+                if not admitted:
+                    return self._send(
+                        429, {"error": {"code": "rate_limited",
+                                        "message": "mutation rate limit exceeded"}},
+                        rate=rate, retry_after=retry_after,
+                    )
+                workflow = engine.define(parts[2], payload)
                 return self._send(200, {"workflow": parts[2], "version": workflow["version"],
-                                        "steps": workflow["steps"]})
+                                        "steps": workflow["steps"]}, rate=rate)
             except SagaError as error:
-                return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
+                # A syntax-invalid write charged nothing: observe (rather than
+                # acquire) so its headers report the untouched window.
+                if rate is None:
+                    rate = self._observe_rate()
+                return self._send(error.status,
+                                  {"error": {"code": error.code, "message": str(error)}},
+                                  rate=rate)
             except Exception:
-                return self._send(500, {"error": {"code": "internal_error"}})
+                return self._send(500, {"error": {"code": "internal_error"}}, rate=rate)
 
         def do_POST(self) -> None:  # noqa: N802
+            rate: tuple[int, int] | None = None
             try:
                 parts = self._parts()
                 if len(parts) == 4 and parts[:2] == ["v1", "workflows"] and parts[3] == "instances":
+                    # Body/If-Match syntax first (400, no quota); the shape check
+                    # after admission is the business layer's existing 400.
                     body = self._read_json() or {}
+                    admitted, rate, retry_after = self._admit()
+                    if not admitted:
+                        return self._send(
+                            429, {"error": {"code": "rate_limited",
+                                            "message": "mutation rate limit exceeded"}},
+                            rate=rate, retry_after=retry_after,
+                        )
                     if not isinstance(body, dict) or set(body) - {"context", "version"}:
                         raise InvalidRequest('body must be {"context": {...}, "version": <int>} when present')
-                    return self._send(201, engine.start(parts[2], body.get("context"), body.get("version")))
+                    return self._send(201, engine.start(parts[2], body.get("context"),
+                                                        body.get("version")), rate=rate)
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "migrate":
                     body = self._read_json()
                     if_match = parse_if_match(self.headers.get("If-Match"))
+                    admitted, rate, retry_after = self._admit()
+                    if not admitted:
+                        return self._send(
+                            429, {"error": {"code": "rate_limited",
+                                            "message": "mutation rate limit exceeded"}},
+                            rate=rate, retry_after=retry_after,
+                        )
                     if not isinstance(body, dict) or set(body) - {"version"} or "version" not in body:
                         raise InvalidRequest('body must be {"version": <positive integer>}')
-                    return self._send(200, engine.migrate(parts[2], body["version"], if_match))
+                    return self._send(200, engine.migrate(parts[2], body["version"], if_match),
+                                      rate=rate)
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "recover":
                     body = self._read_json()
                     if_match = parse_if_match(self.headers.get("If-Match"))
+                    admitted, rate, retry_after = self._admit()
+                    if not admitted:
+                        return self._send(
+                            429, {"error": {"code": "rate_limited",
+                                            "message": "mutation rate limit exceeded"}},
+                            rate=rate, retry_after=retry_after,
+                        )
                     # Recovery carries no payload: only an empty JSON object is accepted.
                     if body != {}:
                         raise InvalidRequest("body must be an empty JSON object {}")
-                    return self._send(200, engine.recover(parts[2], if_match))
+                    return self._send(200, engine.recover(parts[2], if_match), rate=rate)
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "events":
                     body = self._read_json()
                     if_match = parse_if_match(self.headers.get("If-Match"))
+                    admitted, rate, retry_after = self._admit()
+                    if not admitted:
+                        return self._send(
+                            429, {"error": {"code": "rate_limited",
+                                            "message": "mutation rate limit exceeded"}},
+                            rate=rate, retry_after=retry_after,
+                        )
                     if not isinstance(body, dict) or set(body) - {"outcome", "detail", "eventId",
                                                                   "partitionKey", "sequence"}:
                         raise InvalidRequest(
@@ -1458,11 +1642,19 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                     sequence = body["sequence"] if "sequence" in body else _UNSET
                     return self._send(
                         200, engine.advance(parts[2], body.get("outcome"), body.get("detail"),
-                                            event_id, if_match, partition_key, sequence)
+                                            event_id, if_match, partition_key, sequence),
+                        rate=rate,
                     )
                 if len(parts) == 4 and parts[:2] == ["v1", "instances"] and parts[3] == "signals":
                     body = self._read_json()
                     if_match = parse_if_match(self.headers.get("If-Match"))
+                    admitted, rate, retry_after = self._admit()
+                    if not admitted:
+                        return self._send(
+                            429, {"error": {"code": "rate_limited",
+                                            "message": "mutation rate limit exceeded"}},
+                            rate=rate, retry_after=retry_after,
+                        )
                     if not isinstance(body, dict) or set(body) - {"event", "detail", "eventId",
                                                                   "partitionKey", "sequence"}:
                         raise InvalidRequest(
@@ -1476,21 +1668,32 @@ def make_handler(engine: Engine) -> type[BaseHTTPRequestHandler]:
                     sequence = body["sequence"] if "sequence" in body else _UNSET
                     return self._send(
                         200, engine.signal(parts[2], body.get("event"), body.get("detail"),
-                                           event_id, if_match, partition_key, sequence)
+                                           event_id, if_match, partition_key, sequence),
+                        rate=rate,
                     )
                 return self._send(404, {"error": {"code": "not_found"}})
             except SagaError as error:
-                return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
+                # A syntax-invalid write charged nothing; business rejections
+                # after admission already hold their charged headers.
+                if rate is None:
+                    rate = self._observe_rate()
+                return self._send(error.status,
+                                  {"error": {"code": error.code, "message": str(error)}},
+                                  rate=rate)
             except Exception:
-                return self._send(500, {"error": {"code": "internal_error"}})
+                return self._send(500, {"error": {"code": "internal_error"}}, rate=rate)
 
     return Handler
 
 
 def serve(host: str = "127.0.0.1", port: int = 18897, db: str = ":memory:") -> ThreadingHTTPServer:
     engine = Engine(db)
-    httpd = ThreadingHTTPServer((host, port), make_handler(engine))
+    # The limiter is process-local in-memory state: restarting the process
+    # recounts from zero and no SQLite table or record backs it.
+    rate_limiter = RateLimiter()
+    httpd = ThreadingHTTPServer((host, port), make_handler(engine, rate_limiter))
     httpd.engine = engine  # type: ignore[attr-defined]
+    httpd.rate_limiter = rate_limiter  # type: ignore[attr-defined]
     return httpd
 
 
